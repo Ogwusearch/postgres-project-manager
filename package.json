@@ -14,7 +14,8 @@
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
     "test:smoke": "bash scripts/test-api-smoke.sh",
-    "test:integration": "tsx --test tests/integration/*.test.ts"
+    "test:integration": "tsx --test tests/integration/*.test.ts",
+    "db:migrate:control": "node scripts/control-migrations.mjs"
   },
   "keywords": [],
   "author": "",
