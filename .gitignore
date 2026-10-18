@@ -1,0 +1,26 @@
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Environment backup files
+.env.backup.*
+
+# Dependencies and build output
+node_modules/
+dist/
+coverage/
+
+# Database dumps and backups
+*.dump
+*.backup
+*.sql.gz
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+.DS_Store
+
+# Local configuration backups
+*.bak
