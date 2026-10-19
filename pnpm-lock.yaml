@@ -94,7 +94,24 @@ importers:
 
   packages/migration-runner: {}
 
-  packages/postgres-admin: {}
+  packages/postgres-admin:
+    dependencies:
+      pg:
+        specifier: ^8.23.1
+        version: 8.23.1
+    devDependencies:
+      '@types/node':
+        specifier: ^26.6.5
+        version: 26.6.5
+      '@types/pg':
+        specifier: ^8.23.1
+        version: 8.23.1
+      tsx:
+        specifier: ^4.23.15
+        version: 4.23.15
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
 
   packages/project-registry: {}
 
