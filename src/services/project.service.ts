@@ -1,10 +1,9 @@
 import { randomUUID } from "node:crypto";
-import type {
-  ProjectStatus,
-  CreateProjectInput,
-} from "../repositories/project.repository.js";
-
-const statuses = ["active", "inactive", "archived"] as const;
+import {
+  PROJECT_STATUSES,
+  type ProjectStatus,
+} from "@postgres-project-manager/project-registry";
+import type { CreateProjectInput } from "../repositories/project.repository.js";
 
 export interface RegisterProjectInput {
   project_key: string;
@@ -37,7 +36,7 @@ export function validateProjectInput(
 
   if (
     typeof status !== "string" ||
-    !statuses.includes(status as ProjectStatus)
+    !PROJECT_STATUSES.includes(status as ProjectStatus)
   ) {
     throw new Error("status must be active, inactive, or archived.");
   }

@@ -1,23 +1,11 @@
 import { randomUUID } from "node:crypto";
-import type {
-  CreateDatabaseInstanceInput,
-  DatabaseEnvironment,
-  DatabaseInstanceStatus,
-} from "../repositories/database-instance.repository.js";
-
-const environments = [
-  "development",
-  "staging",
-  "production",
-] as const;
-
-const statuses = [
-  "planned",
-  "provisioning",
-  "ready",
-  "failed",
-  "retired",
-] as const;
+import {
+  DATABASE_ENVIRONMENTS,
+  DATABASE_INSTANCE_STATUSES,
+  type DatabaseEnvironment,
+  type DatabaseInstanceStatus,
+} from "@postgres-project-manager/project-registry";
+import type { CreateDatabaseInstanceInput } from "../repositories/database-instance.repository.js";
 
 export interface RegisterDatabaseInstanceInput {
   environment: DatabaseEnvironment;
@@ -58,7 +46,7 @@ export function validateDatabaseInstanceInput(
 
   if (
     typeof environment !== "string" ||
-    !environments.includes(environment as DatabaseEnvironment)
+    !DATABASE_ENVIRONMENTS.includes(environment as DatabaseEnvironment)
   ) {
     throw new Error(
       "environment must be development, staging, or production.",
@@ -80,7 +68,7 @@ export function validateDatabaseInstanceInput(
 
   if (
     typeof status !== "string" ||
-    !statuses.includes(status as DatabaseInstanceStatus)
+    !DATABASE_INSTANCE_STATUSES.includes(status as DatabaseInstanceStatus)
   ) {
     throw new Error(
       "status must be planned, provisioning, ready, failed, or retired.",

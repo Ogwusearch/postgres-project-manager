@@ -8,6 +8,12 @@ importers:
 
   .:
     dependencies:
+      '@postgres-project-manager/migration-runner':
+        specifier: workspace:*
+        version: link:packages/migration-runner
+      '@postgres-project-manager/project-registry':
+        specifier: workspace:*
+        version: link:packages/project-registry
       dotenv:
         specifier: ^18.0.8
         version: 18.0.8
@@ -85,6 +91,12 @@ importers:
   packages/audit-logging: {}
 
   packages/backup-manager: {}
+
+  packages/migration-runner: {}
+
+  packages/postgres-admin: {}
+
+  packages/project-registry: {}
 
 packages:
 
