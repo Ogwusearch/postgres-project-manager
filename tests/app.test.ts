@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createApp } from "../src/app.js";
+import { PgSqlExecutor } from "@postgres-project-manager/postgres-admin";
 import type { SqlExecutor } from "@postgres-project-manager/postgres-admin";
 import type { DatabaseConnectionVerifier } from "../src/app.js";
 import type { DatabaseVerificationResult } from "../src/services/database-connection-verifier.js";
@@ -388,6 +389,34 @@ test("health endpoint reports database connected", async () => {
   });
 
   await app.close();
+});
+
+
+test("health endpoint works through PgSqlExecutor", async () => {
+  const fakePool = {
+    async query(statement: string, parameters: unknown[] = []) {
+      assert.equal(statement, "SELECT 1");
+      assert.deepEqual(parameters, []);
+      return { rows: [{ "?column?": 1 }], rowCount: 1 };
+    },
+  };
+
+  const executor = new PgSqlExecutor(
+    fakePool as unknown as ConstructorParameters<typeof PgSqlExecutor>[0],
+  );
+  const app = createApp(executor);
+
+  try {
+    const response = await app.inject({ method: "GET", url: "/health" });
+
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json(), {
+      status: "ok",
+      database: "connected",
+    });
+  } finally {
+    await app.close();
+  }
 });
 
 test("project creation validates input", async () => {
