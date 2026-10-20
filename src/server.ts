@@ -2,6 +2,7 @@ import { config } from "dotenv";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import pg from "pg";
+import { PgSqlExecutor } from "@postgres-project-manager/postgres-admin";
 
 // Load ordinary project configuration first. The external provisioning file
 // supplies PROVISION_PG* values without overriding already-set environment.
@@ -28,7 +29,8 @@ const pool = new Pool({
   max: 10,
 });
 
-const app = createApp(pool);
+const executor = new PgSqlExecutor(pool);
+const app = createApp(executor);
 
 async function start() {
   try {

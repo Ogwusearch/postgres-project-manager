@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { Pool } from "pg";
 import { createApp } from "../src/app.js";
+import type { SqlExecutor } from "@postgres-project-manager/postgres-admin";
 import type { DatabaseConnectionVerifier } from "../src/app.js";
 import type { DatabaseVerificationResult } from "../src/services/database-connection-verifier.js";
 
@@ -278,7 +278,7 @@ function createTestPool(options: {
     async end() {},
   };
 
-  return { pool: pool as unknown as Pool, instances, auditEvents };
+  return { pool: pool as unknown as SqlExecutor, instances, auditEvents };
 }
 
 function setup(

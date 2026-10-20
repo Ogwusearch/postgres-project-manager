@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Pool } from "pg";
+import type { SqlExecutor } from "@postgres-project-manager/postgres-admin";
 
 export type AuditOutcome = "succeeded" | "failed";
 
@@ -21,10 +21,10 @@ export interface AuditEvent {
   created_at: Date;
 }
 
-export function createAuditEventRepository(pool: Pool) {
+export function createAuditEventRepository(executor: SqlExecutor) {
   return {
     async create(input: CreateAuditEventInput): Promise<AuditEvent> {
-      const result = await pool.query<AuditEvent>(
+      const result = await executor.query<AuditEvent>(
         `INSERT INTO public.audit_events
           (id, actor, action, target, outcome, details)
          VALUES ($1, $2, $3, $4, $5, $6)

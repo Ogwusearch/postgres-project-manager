@@ -1,4 +1,4 @@
-import type { Pool } from "pg";
+import type { SqlExecutor } from "@postgres-project-manager/postgres-admin";
 
 export type DatabaseEnvironment =
   | "development"
@@ -36,12 +36,12 @@ const columns = `
   server_key, status, created_at
 `;
 
-export function createDatabaseInstanceRepository(pool: Pool) {
+export function createDatabaseInstanceRepository(executor: SqlExecutor) {
   return {
     async create(
       input: CreateDatabaseInstanceInput,
     ): Promise<DatabaseInstance> {
-      const result = await pool.query<DatabaseInstance>(
+      const result = await executor.query<DatabaseInstance>(
         `INSERT INTO public.database_instances
           (id, project_id, environment, database_name, server_key, status)
          VALUES ($1, $2, $3, $4, $5, $6)
@@ -60,7 +60,7 @@ export function createDatabaseInstanceRepository(pool: Pool) {
     },
 
     async getById(id: string): Promise<DatabaseInstance | null> {
-      const result = await pool.query<DatabaseInstance>(
+      const result = await executor.query<DatabaseInstance>(
         `SELECT ${columns}
          FROM public.database_instances
          WHERE id = $1
@@ -80,7 +80,7 @@ export function createDatabaseInstanceRepository(pool: Pool) {
         return null;
       }
 
-      const result = await pool.query<DatabaseInstance>(
+      const result = await executor.query<DatabaseInstance>(
         `UPDATE public.database_instances
          SET status = $3
          WHERE id = $1
@@ -94,7 +94,7 @@ export function createDatabaseInstanceRepository(pool: Pool) {
 
     async list(projectId?: string): Promise<DatabaseInstance[]> {
       if (projectId) {
-        const result = await pool.query<DatabaseInstance>(
+        const result = await executor.query<DatabaseInstance>(
           `SELECT ${columns}
            FROM public.database_instances
            WHERE project_id = $1
@@ -105,7 +105,7 @@ export function createDatabaseInstanceRepository(pool: Pool) {
         return result.rows;
       }
 
-      const result = await pool.query<DatabaseInstance>(
+      const result = await executor.query<DatabaseInstance>(
         `SELECT ${columns}
          FROM public.database_instances
          ORDER BY created_at DESC, id`,

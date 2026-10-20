@@ -13,7 +13,7 @@ import {
   provisionDatabase,
 } from "./services/database-provisioner.js";
 import { randomUUID } from "node:crypto";
-import type { Pool } from "pg";
+import type { SqlExecutor } from "@postgres-project-manager/postgres-admin";
 import { createProjectRepository } from "./repositories/project.repository.js";
 import {
   createDatabaseInstanceRepository,
@@ -56,10 +56,10 @@ export interface CreateAppOptions {
   getProvisioningServer?: (serverKey: string) => TrustedDatabaseServer;
 }
 
-export function createApp(pool: Pool, options: CreateAppOptions = {}) {
+export function createApp(executor: SqlExecutor, options: CreateAppOptions = {}) {
   const app = Fastify({ logger: false });
-  const projects = createProjectRepository(pool);
-  const instances = createDatabaseInstanceRepository(pool);
+  const projects = createProjectRepository(executor);
+  const instances = createDatabaseInstanceRepository(executor);
 
   const verifyConnection =
     options.verifyConnection ?? verifyDatabaseConnection;
@@ -71,7 +71,7 @@ export function createApp(pool: Pool, options: CreateAppOptions = {}) {
 
   app.get("/health", async (_request, reply) => {
     try {
-      await pool.query("SELECT 1");
+      await executor.query("SELECT 1");
       return { status: "ok", database: "connected" };
     } catch {
       return reply.code(503).send({
@@ -335,7 +335,7 @@ export function createApp(pool: Pool, options: CreateAppOptions = {}) {
     let finalized = false;
 
     try {
-      const result = await pool.query(
+      const result = await executor.query(
         `
         /* provisioning-finalize */
         WITH current_instance AS MATERIALIZED (
@@ -493,7 +493,7 @@ export function createApp(pool: Pool, options: CreateAppOptions = {}) {
     let lifecycleStatus: string;
 
     try {
-      const result = await pool.query(
+      const result = await executor.query<{ lifecycle_status: string }>(
         `
         WITH current_instance AS MATERIALIZED (
           SELECT id, status

@@ -11,6 +11,9 @@ importers:
       '@postgres-project-manager/migration-runner':
         specifier: workspace:*
         version: link:packages/migration-runner
+      '@postgres-project-manager/postgres-admin':
+        specifier: workspace:*
+        version: link:packages/postgres-admin
       '@postgres-project-manager/project-registry':
         specifier: workspace:*
         version: link:packages/project-registry

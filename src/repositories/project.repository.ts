@@ -1,4 +1,4 @@
-import type { Pool } from "pg";
+import type { SqlExecutor } from "@postgres-project-manager/postgres-admin";
 
 export type ProjectStatus = "active" | "inactive" | "archived";
 
@@ -17,10 +17,10 @@ export interface CreateProjectInput {
   status: ProjectStatus;
 }
 
-export function createProjectRepository(pool: Pool) {
+export function createProjectRepository(executor: SqlExecutor) {
   return {
     async create(input: CreateProjectInput): Promise<Project> {
-      const result = await pool.query<Project>(
+      const result = await executor.query<Project>(
         `INSERT INTO public.projects (id, project_key, name, status)
          VALUES ($1, $2, $3, $4)
          RETURNING id, project_key, name, status, created_at`,
@@ -31,7 +31,7 @@ export function createProjectRepository(pool: Pool) {
     },
 
     async getById(id: string): Promise<Project | null> {
-      const result = await pool.query<Project>(
+      const result = await executor.query<Project>(
         `SELECT id, project_key, name, status, created_at
          FROM public.projects
          WHERE id = $1`,
@@ -42,7 +42,7 @@ export function createProjectRepository(pool: Pool) {
     },
 
     async list(limit: number, offset: number): Promise<Project[]> {
-      const result = await pool.query<Project>(
+      const result = await executor.query<Project>(
         `SELECT id, project_key, name, status, created_at
          FROM public.projects
          ORDER BY created_at DESC, id
