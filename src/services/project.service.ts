@@ -50,9 +50,11 @@ export function validateProjectInput(
 
 export function buildCreateProjectInput(
   input: RegisterProjectInput,
+  tenantId: string,
 ): CreateProjectInput {
   return {
     id: randomUUID(),
+    tenant_id: tenantId,
     project_key: input.project_key,
     name: input.name,
     status: input.status ?? "active",

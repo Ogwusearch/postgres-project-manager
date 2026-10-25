@@ -24,3 +24,6 @@ coverage/
 
 # Local configuration backups
 *.bak
+
+# Local recovery backups (never commit)
+.local-backups/

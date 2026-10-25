@@ -40,10 +40,12 @@ function assertSafeTestDatabase(): asserts databaseName is string {
 
 const verificationSql = `
   WITH current_instance AS MATERIALIZED (
-    SELECT id, status
-    FROM public.database_instances
-    WHERE id = $1
-    FOR UPDATE
+    SELECT di.id, di.status
+    FROM public.database_instances AS di
+    JOIN public.projects AS p ON p.id = di.project_id
+    WHERE di.id = $1
+      AND p.tenant_id = $9
+    FOR UPDATE OF di
   ),
   transitioned AS (
     UPDATE public.database_instances AS di
@@ -86,8 +88,8 @@ test("PostgreSQL verification status and audit are atomic", async () => {
   const pool = new Pool({
     host: process.env.PGHOST ?? "127.0.0.1",
     port: Number(process.env.PGPORT ?? 55432),
-    user: process.env.PGUSER,
-    password: process.env.PGPASSWORD,
+    user: process.env.CONTROL_MIGRATION_USER,
+    password: process.env.CONTROL_MIGRATION_PASSWORD,
     database: databaseName,
     connectionTimeoutMillis: 5000,
     max: 1,
@@ -113,10 +115,21 @@ test("PostgreSQL verification status and audit are atomic", async () => {
     const duplicateAuditId = randomUUID();
     const suffix = randomUUID().replaceAll("-", "").slice(0, 16);
 
+    const tenant = await client.query<{ id: string }>(
+      "SELECT id FROM public.tenants WHERE tenant_key = 'legacy'",
+    );
+    assert.ok(tenant.rows[0], "Expected the legacy test tenant to exist");
+    const tenantId = tenant.rows[0].id;
+
     await client.query(
-      `INSERT INTO public.projects (id, project_key, name)
-       VALUES ($1, $2, $3)`,
-      [projectId, `atomic-test-${suffix}`, "Atomic verification integration test"],
+      `INSERT INTO public.projects (id, project_key, name, tenant_id)
+       VALUES ($1, $2, $3, $4)`,
+      [
+        projectId,
+        `atomic-test-${suffix}`,
+        "Atomic verification integration test",
+        tenantId,
+      ],
     );
 
     await client.query(
@@ -149,6 +162,7 @@ test("PostgreSQL verification status and audit are atomic", async () => {
         database_name: `atomic_success_${suffix}`,
         duration_ms: 1,
       }),
+      tenantId,
     ]);
 
     assert.equal(success.rows[0]?.lifecycle_status, "ready");
@@ -194,6 +208,7 @@ test("PostgreSQL verification status and audit are atomic", async () => {
           database_name: `atomic_failure_${suffix}`,
           duration_ms: 1,
         }),
+        tenantId,
       ]);
     } catch (error) {
       expectedError = error as { code?: string };

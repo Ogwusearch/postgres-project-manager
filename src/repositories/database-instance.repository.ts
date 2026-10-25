@@ -36,6 +36,11 @@ const columns = `
   server_key, status, created_at
 `;
 
+const joinedColumns = `
+  di.id, di.project_id, di.environment, di.database_name,
+  di.server_key, di.status, di.created_at
+`;
+
 export function createDatabaseInstanceRepository(executor: SqlExecutor) {
   return {
     async create(
@@ -59,13 +64,18 @@ export function createDatabaseInstanceRepository(executor: SqlExecutor) {
       return result.rows[0]!;
     },
 
-    async getById(id: string): Promise<DatabaseInstance | null> {
+    async getById(
+      id: string,
+      tenantId: string,
+    ): Promise<DatabaseInstance | null> {
       const result = await executor.query<DatabaseInstance>(
-        `SELECT ${columns}
-         FROM public.database_instances
-         WHERE id = $1
+        `SELECT ${joinedColumns}
+         FROM public.database_instances AS di
+         JOIN public.projects AS p ON p.id = di.project_id
+         WHERE di.id = $1
+           AND p.tenant_id = $2
          LIMIT 1`,
-        [id],
+        [id, tenantId],
       );
 
       return result.rows[0] ?? null;
@@ -73,6 +83,7 @@ export function createDatabaseInstanceRepository(executor: SqlExecutor) {
 
     async transitionStatus(
       id: string,
+      tenantId: string,
       expectedStatuses: DatabaseInstanceStatus[],
       nextStatus: DatabaseInstanceStatus,
     ): Promise<DatabaseInstance | null> {
@@ -81,34 +92,37 @@ export function createDatabaseInstanceRepository(executor: SqlExecutor) {
       }
 
       const result = await executor.query<DatabaseInstance>(
-        `UPDATE public.database_instances
-         SET status = $3
-         WHERE id = $1
-           AND status = ANY($2::text[])
-         RETURNING ${columns}`,
-        [id, expectedStatuses, nextStatus],
+        `UPDATE public.database_instances AS di
+         SET status = $4
+         WHERE di.id = $1
+           AND di.status = ANY($3::text[])
+           AND EXISTS (
+             SELECT 1
+             FROM public.projects AS p
+             WHERE p.id = di.project_id
+               AND p.tenant_id = $2
+           )
+         RETURNING ${joinedColumns}`,
+        [id, tenantId, expectedStatuses, nextStatus],
       );
 
       return result.rows[0] ?? null;
     },
 
-    async list(projectId?: string): Promise<DatabaseInstance[]> {
-      if (projectId) {
-        const result = await executor.query<DatabaseInstance>(
-          `SELECT ${columns}
-           FROM public.database_instances
-           WHERE project_id = $1
-           ORDER BY created_at DESC, id`,
-          [projectId],
-        );
-
-        return result.rows;
-      }
-
+    async list(
+      tenantId: string,
+      projectIds: string[],
+      projectId?: string,
+    ): Promise<DatabaseInstance[]> {
       const result = await executor.query<DatabaseInstance>(
-        `SELECT ${columns}
-         FROM public.database_instances
-         ORDER BY created_at DESC, id`,
+        `SELECT ${joinedColumns}
+         FROM public.database_instances AS di
+         JOIN public.projects AS p ON p.id = di.project_id
+         WHERE p.tenant_id = $1
+           AND di.project_id = ANY($2::uuid[])
+           AND ($3::uuid IS NULL OR di.project_id = $3::uuid)
+         ORDER BY di.created_at DESC, di.id`,
+        [tenantId, projectIds, projectId ?? null],
       );
 
       return result.rows;

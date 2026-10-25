@@ -1,4 +1,32 @@
 import Fastify from "fastify";
+import type { FastifyRequest } from "fastify";
+import {
+  authorize,
+  type AccessPermission,
+  type AccessResource,
+} from "@postgres-project-manager/access-control";
+import {
+  createAuthRepository,
+  type ActiveSession,
+} from "./repositories/auth.repository.js";
+import {
+  CSRF_COOKIE,
+  SESSION_COOKIE,
+  SESSION_LIFETIME_SECONDS,
+  clearSessionCookies,
+  createToken,
+  csrfCookie,
+  csrfTokensMatch,
+  hashToken,
+  normalizeEmail,
+  readCookie,
+  sessionCookie,
+  verifyPassword,
+} from "./services/authentication.js";
+import {
+  resolveTenantAuthorizationContext,
+  type TenantAuthorizationContext,
+} from "./services/authorization-context.js";
 import {
   getTrustedDatabaseServer,
   type TrustedDatabaseServer,
@@ -13,6 +41,7 @@ import {
   provisionDatabase,
 } from "./services/database-provisioner.js";
 import { randomUUID } from "node:crypto";
+import { createLoginThrottle } from "./services/login-throttle.js";
 import type { SqlExecutor } from "@postgres-project-manager/postgres-admin";
 import { createProjectRepository } from "./repositories/project.repository.js";
 import {
@@ -54,12 +83,34 @@ export interface CreateAppOptions {
   getTrustedServer?: (serverKey: string) => TrustedDatabaseServer;
   provisionDatabase?: DatabaseProvisioner;
   getProvisioningServer?: (serverKey: string) => TrustedDatabaseServer;
+  loginThrottle?: ReturnType<typeof createLoginThrottle>;
 }
 
 export function createApp(executor: SqlExecutor, options: CreateAppOptions = {}) {
-  const app = Fastify({ logger: false });
+  const app = Fastify({
+    logger: false,
+    trustProxy: false,
+  });
   const projects = createProjectRepository(executor);
   const instances = createDatabaseInstanceRepository(executor);
+  const auth = createAuthRepository(executor);
+  const loginThrottle = options.loginThrottle ?? createLoginThrottle();
+
+  const requestSessions = new WeakMap<FastifyRequest, ActiveSession>();
+  const requestContexts =
+    new WeakMap<FastifyRequest, TenantAuthorizationContext>();
+
+  function permits(
+    context: TenantAuthorizationContext,
+    action: AccessPermission,
+    resource: AccessResource,
+  ): boolean {
+    return authorize({
+      subject: context.subject,
+      action,
+      resource,
+    }).allowed;
+  }
 
   const verifyConnection =
     options.verifyConnection ?? verifyDatabaseConnection;
@@ -69,6 +120,256 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
   const resolveProvisioningServer =
     options.getProvisioningServer ?? getTrustedProvisioningServer;
 
+  // Fail-closed authentication, CSRF, tenant resolution, and route authorization.
+  app.addHook("preHandler", async (request, reply) => {
+    const pathname = (request.url.split("?")[0] ?? "/").replace(/\/+$/, "") || "/";
+    if (!pathname.startsWith("/api/") || pathname === "/api/auth/login") {
+      return;
+    }
+
+    try {
+      const rawSessionToken = readCookie(
+        request.headers.cookie,
+        SESSION_COOKIE,
+      );
+
+      // Logout must remain possible with an expired or missing session cookie.
+      if (!rawSessionToken && pathname === "/api/auth/logout") {
+        return;
+      }
+
+      if (!rawSessionToken) {
+        return reply.code(401).send({ error: "Authentication required." });
+      }
+
+      const session = await auth.findActiveSession(hashToken(rawSessionToken));
+
+      if (!session) {
+        if (pathname === "/api/auth/logout") {
+          return;
+        }
+
+        return reply.code(401).send({
+          error: "Session is invalid, expired, revoked, or disabled.",
+        });
+      }
+
+      requestSessions.set(request, session);
+
+      const isMutating = !["GET", "HEAD", "OPTIONS"].includes(request.method);
+      if (isMutating) {
+        const csrfCookie = readCookie(request.headers.cookie, CSRF_COOKIE);
+        const header = request.headers["x-csrf-token"];
+        const csrfHeader = typeof header === "string" ? header : undefined;
+
+        if (
+          !csrfTokensMatch(
+            csrfCookie,
+            csrfHeader,
+            session.csrf_token_hash,
+          )
+        ) {
+          return reply.code(403).send({ error: "CSRF validation failed." });
+        }
+      }
+
+      if (pathname === "/api/auth/me" || pathname === "/api/auth/logout") {
+        return;
+      }
+
+      const tenantHeader = request.headers["x-tenant-id"];
+      const requestedTenantId =
+        typeof tenantHeader === "string" ? tenantHeader : undefined;
+
+      const resolution = await resolveTenantAuthorizationContext(
+        auth,
+        session,
+        requestedTenantId,
+      );
+
+      if (!resolution.ok) {
+        return reply.code(resolution.status).send({
+          error: resolution.error,
+        });
+      }
+
+      const context = resolution.context;
+      requestContexts.set(request, context);
+
+      if (pathname === "/api/projects") {
+        if (request.method === "POST") {
+          const allowed = permits(context, "project:create", {
+            type: "tenant",
+            id: context.tenant.id,
+            tenantId: context.tenant.id,
+          });
+
+          if (!allowed) {
+            return reply.code(403).send({ error: "Project creation is not permitted." });
+          }
+        } else if (
+          request.method === "GET" &&
+          !context.subject.permissions.includes("project:read")
+        ) {
+          return reply.code(403).send({ error: "Project access is not permitted." });
+        }
+
+        return;
+      }
+
+      if (/^\/api\/projects\/[^/]+\/database-instances$/.test(pathname)) {
+        const params = request.params as { projectId?: string };
+        const projectId = params.projectId;
+
+        if (!projectId || !isUuid(projectId)) {
+          return;
+        }
+
+        const project = await projects.getById(projectId, context.tenant.id);
+
+        if (!project) {
+          return reply.code(404).send({ error: "Project not found." });
+        }
+
+        if (request.method === "POST") {
+          const allowed = permits(context, "database-instance:create", {
+            type: "project",
+            id: project.id,
+            tenantId: context.tenant.id,
+          });
+
+          if (!allowed) {
+            return reply.code(403).send({
+              error: "Database instance creation is not permitted for this project.",
+            });
+          }
+        } else if (request.method === "GET") {
+          const allowed = permits(context, "project:read", {
+            type: "project",
+            id: project.id,
+            tenantId: context.tenant.id,
+          });
+
+          if (
+            !allowed ||
+            !context.subject.permissions.includes("database-instance:read")
+          ) {
+            return reply.code(403).send({
+              error: "Database instance access is not permitted for this project.",
+            });
+          }
+        }
+
+        return;
+      }
+
+      if (pathname === "/api/database-instances" && request.method === "GET") {
+        if (!context.subject.permissions.includes("database-instance:read")) {
+          return reply.code(403).send({
+            error: "Database instance access is not permitted.",
+          });
+        }
+
+        const query = request.query as { project_id?: string };
+        if (query.project_id) {
+          if (!isUuid(query.project_id)) {
+            return reply.code(400).send({
+              error: "project_id must be a valid UUID.",
+            });
+          }
+
+          const project = await projects.getById(
+            query.project_id,
+            context.tenant.id,
+          );
+
+          if (!project) {
+            return reply.code(404).send({ error: "Project not found." });
+          }
+
+          if (
+            !permits(context, "project:read", {
+              type: "project",
+              id: project.id,
+              tenantId: context.tenant.id,
+            })
+          ) {
+            return reply.code(403).send({
+              error: "Database instance access is not permitted for this project.",
+            });
+          }
+        }
+
+        return;
+      }
+
+      const instanceRoute = pathname.match(
+        /^\/api\/database-instances\/([^/]+)\/(provision|verify)$/,
+      );
+
+      if (instanceRoute && request.method === "POST") {
+        const params = request.params as { id?: string };
+        const id = params.id;
+
+        if (!id || !isUuid(id)) {
+          return;
+        }
+
+        const instance = await instances.getById(id, context.tenant.id);
+
+        if (!instance) {
+          return reply.code(404).send({
+            error: "Database instance not found.",
+          });
+        }
+
+        const allowed = permits(context, "database-instance:update", {
+          type: "database-instance",
+          id: instance.id,
+          tenantId: context.tenant.id,
+          projectId: instance.project_id,
+        });
+
+        if (!allowed) {
+          return reply.code(403).send({
+            error: "Database instance operation is not permitted.",
+          });
+        }
+
+        return;
+      }
+
+      // Unknown /api routes fail closed rather than inheriting access.
+      return reply.code(404).send({ error: "Not found." });
+    } catch (error) {
+      request.log.error({ err: error }, "Authentication or authorization failed");
+      return reply.code(500).send({
+        error: "Unable to validate authentication and authorization.",
+      });
+    }
+  });
+
+  // Liveness: confirms the application process can respond.
+  // Deliberately does not depend on database availability.
+  app.get("/health/live", async () => {
+    return { status: "ok" };
+  });
+
+  // Readiness: confirms the control database is reachable.
+  // Do not expose database hosts, usernames, or driver error details.
+  app.get("/health/ready", async (_request, reply) => {
+    try {
+      await executor.query("SELECT 1");
+      return { status: "ok", database: "connected" };
+    } catch {
+      return reply.code(503).send({
+        status: "error",
+        database: "unavailable",
+      });
+    }
+  });
+
+  // Backward compatibility for existing health-check clients.
   app.get("/health", async (_request, reply) => {
     try {
       await executor.query("SELECT 1");
@@ -78,6 +379,142 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
         status: "error",
         database: "unavailable",
       });
+    }
+  });
+
+  app.post("/api/auth/login", async (request, reply) => {
+    const body = request.body;
+
+    if (
+      typeof body !== "object" ||
+      body === null ||
+      Array.isArray(body)
+    ) {
+      return reply.code(400).send({ error: "A JSON object is required." });
+    }
+
+    const input = body as Record<string, unknown>;
+    const email = typeof input.email === "string"
+      ? normalizeEmail(input.email)
+      : "";
+    const password = typeof input.password === "string"
+      ? input.password
+      : "";
+
+    if (
+      email.length < 3 ||
+      email.length > 254 ||
+      password.length === 0 ||
+      password.length > 1024
+    ) {
+      return reply.code(400).send({ error: "Email and password are required." });
+    }
+
+    const throttleDecision = loginThrottle.check(email, request.ip);
+
+    if (throttleDecision.limited) {
+      return reply
+        .header("Retry-After", String(throttleDecision.retryAfterSeconds))
+        .code(429)
+        .send({ error: "Too many login attempts. Please try again later." });
+    }
+
+    try {
+      const user = await auth.findUserByEmail(email);
+      const passwordValid = user
+        ? await verifyPassword(password, user.password_hash)
+        : false;
+
+      if (!user || user.status !== "active" || !passwordValid) {
+        loginThrottle.failed(email, request.ip);
+
+        return reply.code(401).send({
+          error: "Invalid email or password.",
+        });
+      }
+
+      loginThrottle.succeeded(email);
+
+      const sessionToken = createToken();
+      const csrfToken = createToken();
+      const expiresAt = new Date(
+        Date.now() + SESSION_LIFETIME_SECONDS * 1000,
+      );
+
+      const userAgent = request.headers["user-agent"];
+
+      await auth.createSession({
+        id: randomUUID(),
+        user_id: user.id,
+        token_hash: hashToken(sessionToken),
+        csrf_token_hash: hashToken(csrfToken),
+        expires_at: expiresAt,
+        user_agent: typeof userAgent === "string"
+          ? userAgent.slice(0, 512)
+          : null,
+        client_ip: request.ip || null,
+      });
+
+      return reply
+        .header("set-cookie", [
+          sessionCookie(sessionToken),
+          csrfCookie(csrfToken),
+        ])
+        .send({
+          data: {
+            id: user.id,
+            email: user.email,
+            is_super_admin: user.is_super_admin,
+          },
+        });
+    } catch (error) {
+      request.log.error({ err: error }, "Login failed");
+      return reply.code(500).send({ error: "Unable to sign in." });
+    }
+  });
+
+  app.get("/api/auth/me", async (request, reply) => {
+    const session = requestSessions.get(request);
+
+    if (!session) {
+      return reply.code(401).send({ error: "Authentication required." });
+    }
+
+    try {
+      const memberships = await auth.listMemberships(session.user_id);
+
+      return {
+        data: {
+          id: session.user_id,
+          email: session.email,
+          is_super_admin: session.is_super_admin,
+          memberships,
+        },
+      };
+    } catch (error) {
+      request.log.error({ err: error }, "Failed to retrieve session profile");
+      return reply.code(500).send({ error: "Unable to retrieve profile." });
+    }
+  });
+
+  app.post("/api/auth/logout", async (request, reply) => {
+    const rawSessionToken = readCookie(
+      request.headers.cookie,
+      SESSION_COOKIE,
+    );
+
+    try {
+      if (rawSessionToken) {
+        await auth.revokeSession(hashToken(rawSessionToken));
+      }
+
+      return reply
+        .header("set-cookie", clearSessionCookies())
+        .code(204)
+        .send();
+    } catch (error) {
+      request.log.error({ err: error }, "Logout failed");
+      return reply.code(500).send({ error: "Unable to sign out." });
     }
   });
 
@@ -91,7 +528,7 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
     }
 
     try {
-      const project = await projects.create(buildCreateProjectInput(input));
+      const project = await projects.create(buildCreateProjectInput(input, requestContexts.get(request)!.tenant.id));
       return reply.code(201).send({ data: project });
     } catch (error) {
       const databaseError = error as { code?: string };
@@ -128,7 +565,12 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
     }
 
     try {
-      const data = await projects.list(limit, offset);
+      const data = await projects.list(
+        requestContexts.get(request)!.tenant.id,
+        requestContexts.get(request)!.subject.projectIds as string[],
+        limit,
+        offset,
+      );
       return { data, pagination: { limit, offset, count: data.length } };
     } catch (error) {
       request.log.error({ err: error }, "Failed to list projects");
@@ -156,7 +598,7 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
     }
 
     try {
-      const project = await projects.getById(projectId);
+      const project = await projects.getById(projectId, requestContexts.get(request)!.tenant.id);
 
       if (!project) {
         return reply.code(404).send({ error: "Project not found." });
@@ -198,13 +640,17 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
     }
 
     try {
-      const project = await projects.getById(projectId);
+      const project = await projects.getById(projectId, requestContexts.get(request)!.tenant.id);
 
       if (!project) {
         return reply.code(404).send({ error: "Project not found." });
       }
 
-      return { data: await instances.list(projectId) };
+      return { data: await instances.list(
+        requestContexts.get(request)!.tenant.id,
+        requestContexts.get(request)!.subject.projectIds as string[],
+        projectId,
+      ) };
     } catch (error) {
       request.log.error({ err: error }, "Failed to list project database instances");
       return reply.code(500).send({
@@ -226,14 +672,18 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
 
     try {
       if (projectId) {
-        const project = await projects.getById(projectId);
+        const project = await projects.getById(projectId, requestContexts.get(request)!.tenant.id);
 
         if (!project) {
           return reply.code(404).send({ error: "Project not found." });
         }
       }
 
-      return { data: await instances.list(projectId) };
+      return { data: await instances.list(
+        requestContexts.get(request)!.tenant.id,
+        requestContexts.get(request)!.subject.projectIds as string[],
+        projectId,
+      ) };
     } catch (error) {
       request.log.error({ err: error }, "Failed to list database instances");
       return reply.code(500).send({
@@ -257,7 +707,7 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
     let instance: DatabaseInstance | null;
 
     try {
-      instance = await instances.getById(id);
+      instance = await instances.getById(id, requestContexts.get(request)!.tenant.id);
     } catch (error) {
       request.log.error({ err: error }, "Failed to retrieve database instance");
       return reply.code(500).send({
@@ -295,6 +745,7 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
     try {
       claimed = await instances.transitionStatus(
         id,
+        requestContexts.get(request)!.tenant.id,
         ["planned"],
         "provisioning",
       );
@@ -339,10 +790,12 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
         `
         /* provisioning-finalize */
         WITH current_instance AS MATERIALIZED (
-          SELECT id, status
-          FROM public.database_instances
-          WHERE id = $1
-          FOR UPDATE
+          SELECT di.id, di.status
+          FROM public.database_instances AS di
+          JOIN public.projects AS p ON p.id = di.project_id
+          WHERE di.id = $1
+            AND p.tenant_id = $9
+          FOR UPDATE OF di
         ),
         transitioned AS (
           UPDATE public.database_instances AS di
@@ -379,7 +832,7 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
           id,
           nextStatus,
           randomUUID(),
-          "system",
+          requestContexts.get(request)!.userId,
           "database.provision",
           `database_instance:${id}`,
           auditOutcome,
@@ -390,6 +843,7 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
               ? { error_code: provisioningErrorCode }
               : {}),
           }),
+          requestContexts.get(request)!.tenant.id,
         ],
       );
 
@@ -453,7 +907,7 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
     let instance: DatabaseInstance | null;
 
     try {
-      instance = await instances.getById(id);
+      instance = await instances.getById(id, requestContexts.get(request)!.tenant.id);
     } catch (error) {
       request.log.error({ err: error }, "Failed to retrieve database instance");
       return reply.code(500).send({
@@ -496,10 +950,12 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
       const result = await executor.query<{ lifecycle_status: string }>(
         `
         WITH current_instance AS MATERIALIZED (
-          SELECT id, status
-          FROM public.database_instances
-          WHERE id = $1
-          FOR UPDATE
+          SELECT di.id, di.status
+          FROM public.database_instances AS di
+          JOIN public.projects AS p ON p.id = di.project_id
+          WHERE di.id = $1
+            AND p.tenant_id = $9
+          FOR UPDATE OF di
         ),
         transitioned AS (
           UPDATE public.database_instances AS di
@@ -542,7 +998,7 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
           instance.id,
           verification.ok,
           randomUUID(),
-          "system",
+          requestContexts.get(request)!.userId,
           "database.connection.verify",
           `database_instance:${instance.id}`,
           verification.ok ? "succeeded" : "failed",
@@ -552,6 +1008,7 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
             database_name: instance.database_name,
             duration_ms: verification.durationMs,
           }),
+          requestContexts.get(request)!.tenant.id,
         ],
       );
 

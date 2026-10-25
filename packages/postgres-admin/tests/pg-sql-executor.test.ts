@@ -59,3 +59,30 @@ test("returns a null rowCount when the driver reports one", async () => {
   assert.deepEqual(result.rows, []);
   assert.equal(result.rowCount, null);
 });
+
+test("propagates the original database error", async () => {
+  const databaseError = Object.assign(
+    new Error("Simulated PostgreSQL query failure"),
+    { code: "08006" },
+  );
+
+  const fakePool = {
+    async query() {
+      throw databaseError;
+    },
+  } as unknown as Pick<Pool, "query">;
+
+  const executor = new PgSqlExecutor(fakePool);
+
+  await assert.rejects(
+    executor.query("SELECT 1"),
+    (error: unknown) => {
+      assert.equal(error, databaseError);
+      assert.equal(
+        (error as { code?: string }).code,
+        "08006",
+      );
+      return true;
+    },
+  );
+});

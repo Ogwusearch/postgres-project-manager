@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import {
   mkdtemp,
   mkdir,
+  readFile,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -11,12 +12,14 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import { Client } from "pg";
 
-const expectedDatabase = "ppm_test_control_migrations_20261019";
+const expectedDatabase = "ppm_test_control_migrations_disposable_20261019";
 const database = process.env.CONTROL_MIGRATION_DATABASE;
 const user = process.env.CONTROL_MIGRATION_USER;
 const password = process.env.CONTROL_MIGRATION_PASSWORD;
 const host = process.env.CONTROL_MIGRATION_HOST;
 const port = Number(process.env.CONTROL_MIGRATION_PORT ?? "55433");
+
+
 
 const root = process.cwd();
 const runner = resolve(root, "scripts/control-migrations.mjs");
@@ -24,9 +27,19 @@ const lockKeys = [73198420, 11235813];
 
 function assertSafeTarget(): void {
   assert.equal(
+    process.env.CONTROL_MIGRATION_ALLOW_SCHEMA_RESET,
+    "1",
+    "Refusing to run destructive integration tests without CONTROL_MIGRATION_ALLOW_SCHEMA_RESET=1",
+  );
+  assert.equal(
     database,
     expectedDatabase,
     "Refusing to run: CONTROL_MIGRATION_DATABASE must equal the dedicated test database",
+  );
+  assert.equal(
+    user,
+    "ppm_control_migration_test",
+    "Refusing to run: CONTROL_MIGRATION_USER must be the dedicated non-superuser test role",
   );
   assert.ok(user, "CONTROL_MIGRATION_USER is required");
   assert.ok(password, "CONTROL_MIGRATION_PASSWORD is required");
@@ -165,6 +178,7 @@ test(
       const fresh = await runRunner();
       assert.equal(fresh.code, 0, fresh.stderr);
       assert.match(fresh.stdout, /Applied: 001_initial_registry\.sql/);
+      assert.match(fresh.stdout, /Applied: 002_auth_and_tenancy\.sql/);
 
       const tables = await client.query<{ tablename: string }>(`
         SELECT tablename
@@ -177,20 +191,173 @@ test(
         tables.rows.map((row) => row.tablename),
         [
           "audit_events",
+          "auth_sessions",
           "backup_runs",
           "control_schema_migrations",
           "database_instances",
           "migration_runs",
+          "project_assignments",
           "projects",
+          "tenant_memberships",
+          "tenants",
+          "users",
         ],
       );
-      assert.equal(await historyCount(client), 1);
+      assert.equal(await historyCount(client), 2);
+
+      // Verify the database enforces tenant-scoped ownership.
+      const tenantColumn = await client.query<{ attnotnull: boolean }>(`
+        SELECT a.attnotnull
+        FROM pg_attribute a
+        WHERE a.attrelid = 'public.projects'::regclass
+          AND a.attname = 'tenant_id'
+          AND NOT a.attisdropped
+      `);
+      assert.equal(
+        tenantColumn.rows[0]?.attnotnull,
+        true,
+        "projects.tenant_id must be NOT NULL",
+      );
+
+      const tenantConstraints = await client.query<{
+        constraint_name: string;
+        definition: string;
+      }>(`
+        SELECT c.conname AS constraint_name,
+               pg_get_constraintdef(c.oid) AS definition
+        FROM pg_constraint c
+        WHERE c.conrelid IN (
+          'public.projects'::regclass,
+          'public.tenant_memberships'::regclass,
+          'public.project_assignments'::regclass
+        )
+          AND c.conname IN (
+            'projects_id_tenant_id_unique',
+            'tenant_memberships_user_tenant_id_unique',
+            'project_assignments_user_tenant_fkey',
+            'project_assignments_project_tenant_fkey'
+          )
+        ORDER BY c.conname
+      `);
+
+
+
+
+      assert.deepEqual(
+        tenantConstraints.rows.map((row) => row.constraint_name),
+        [
+          "project_assignments_project_tenant_fkey",
+          "project_assignments_user_tenant_fkey",
+          "projects_id_tenant_id_unique",
+          "tenant_memberships_user_tenant_id_unique",
+        ],
+      );
+
+      const constraintDefinitions = new Map(
+        tenantConstraints.rows.map((row) => [
+          row.constraint_name,
+          row.definition,
+        ]),
+      );
+
+      assert.match(
+        constraintDefinitions.get("projects_id_tenant_id_unique") ?? "",
+        /UNIQUE \(id, tenant_id\)/,
+      );
+      assert.match(
+        constraintDefinitions.get("tenant_memberships_user_tenant_id_unique") ?? "",
+        /UNIQUE \(user_id, tenant_id\)/,
+      );
+      assert.match(
+        constraintDefinitions.get("project_assignments_user_tenant_fkey") ?? "",
+        /FOREIGN KEY \(user_id, tenant_id\).*tenant_memberships\(user_id, tenant_id\)/,
+      );
+      assert.match(
+        constraintDefinitions.get("project_assignments_project_tenant_fkey") ?? "",
+        /FOREIGN KEY \(project_id, tenant_id\).*projects\(id, tenant_id\)/,
+      );
+
+      // Verify the legacy tenant is created exactly once.
+      const legacyTenant = await client.query<{
+        tenant_key: string;
+        name: string;
+        status: string;
+      }>(`
+        SELECT tenant_key, name, status
+        FROM public.tenants
+        WHERE tenant_key = 'legacy'
+      `);
+
+      assert.deepEqual(legacyTenant.rows, [
+        {
+          tenant_key: "legacy",
+          name: "Legacy Tenant (existing projects)",
+          status: "active",
+        },
+      ]);
+
+      // Verify authentication schema constraints exist.
+      const authConstraints = await client.query<{
+        conname: string;
+        definition: string;
+      }>(`
+        SELECT conname, pg_get_constraintdef(oid) AS definition
+        FROM pg_constraint
+        WHERE conrelid IN (
+          'public.tenants'::regclass,
+          'public.users'::regclass,
+          'public.tenant_memberships'::regclass,
+          'public.auth_sessions'::regclass
+        )
+        ORDER BY conname
+      `);
+
+      const authDefinitions = new Map(
+        authConstraints.rows.map((row) => [
+          row.conname,
+          row.definition,
+        ]),
+      );
+
+      for (const name of [
+        "tenants_status_check",
+        "tenants_key_format_check",
+        "tenants_name_nonempty_check",
+        "users_email_normalized_check",
+        "users_password_hash_length_check",
+        "users_status_check",
+        "tenant_memberships_role_check",
+        "auth_sessions_token_hash_check",
+        "auth_sessions_csrf_hash_check",
+        "auth_sessions_expiry_check",
+        "auth_sessions_last_seen_check",
+        "auth_sessions_revocation_check",
+      ]) {
+        assert.ok(
+          authDefinitions.has(name),
+          `Expected authentication constraint: ${name}`,
+        );
+      }
+
+      // Confirm the super-admin privilege is not granted by default.
+      const userDefaults = await client.query<{
+        column_default: string | null;
+      }>(`
+        SELECT column_default
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'users'
+          AND column_name = 'is_super_admin'
+      `);
+
+      assert.equal(userDefaults.rows[0]?.column_default, "false");
 
       // 2. Re-running is idempotent.
       const repeated = await runRunner();
       assert.equal(repeated.code, 0, repeated.stderr);
       assert.match(repeated.stdout, /Already applied: 001_initial_registry\.sql/);
-      assert.equal(await historyCount(client), 1);
+      assert.match(repeated.stdout, /Already applied: 002_auth_and_tenancy\.sql/);
+      assert.equal(await historyCount(client), 2);
 
       // 3. Checksum drift must be rejected.
       await client.query(`
@@ -206,7 +373,7 @@ test(
       // 4. A version gap must be rejected.
       await client.query(`
         UPDATE public.control_schema_migrations
-        SET version = '002', filename = '002_initial_registry.sql'
+        SET version = '003', filename = '003_missing_migration.sql'
         WHERE version = '001'
       `);
 
@@ -217,16 +384,19 @@ test(
       // 5. Baseline is explicit and does not re-execute migration SQL.
       await resetPublicSchema(client);
 
-      const prepareBaseline = await runRunner();
-      assert.equal(prepareBaseline.code, 0, prepareBaseline.stderr);
-
-      await client.query(
-        "DROP TABLE public.control_schema_migrations",
+      // Create only the legacy schema represented by migration 001.
+      const initialMigration = await readFile(
+        resolve(root, "database/control-migrations/001_initial_registry.sql"),
+        "utf8",
       );
+      await client.query(initialMigration);
 
       const implicitBaseline = await runRunner();
       assert.notEqual(implicitBaseline.code, 0);
-      assert.match(implicitBaseline.stderr, /use --baseline-existing explicitly/);
+      assert.match(
+        implicitBaseline.stderr,
+        /use --baseline-existing explicitly/,
+      );
       assert.equal(
         (await client.query(
           "SELECT to_regclass('public.control_schema_migrations') AS name",
@@ -234,10 +404,18 @@ test(
         null,
       );
 
+      // Explicit baseline records 001 and applies migration 002.
       const explicitBaseline = await runRunner(["--baseline-existing"]);
       assert.equal(explicitBaseline.code, 0, explicitBaseline.stderr);
-      assert.match(explicitBaseline.stdout, /Baselined 001_initial_registry\.sql/);
-      assert.equal(await historyCount(client), 1);
+      assert.match(
+        explicitBaseline.stdout,
+        /Baselined 001_initial_registry\.sql/,
+      );
+      assert.match(
+        explicitBaseline.stdout,
+        /Applied: 002_auth_and_tenancy\.sql/,
+      );
+      assert.equal(await historyCount(client), 2);
 
       // 6. History without registry tables must be rejected.
       await resetPublicSchema(client);
@@ -321,7 +499,7 @@ test(
 
       assert.equal(firstResult.code, 0, firstResult.stderr);
       assert.equal(secondResult.code, 0, secondResult.stderr);
-      assert.equal(await historyCount(client), 1);
+      assert.equal(await historyCount(client), 2);
 
       const finalTables = await client.query<{ tablename: string }>(`
         SELECT tablename
@@ -334,11 +512,16 @@ test(
         finalTables.rows.map((row) => row.tablename),
         [
           "audit_events",
+          "auth_sessions",
           "backup_runs",
           "control_schema_migrations",
           "database_instances",
           "migration_runs",
+          "project_assignments",
           "projects",
+          "tenant_memberships",
+          "tenants",
+          "users",
         ],
       );
     } finally {

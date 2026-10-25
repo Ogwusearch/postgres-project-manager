@@ -156,6 +156,15 @@ test("validates ordered migration history", () => {
   assert.throws(
     () =>
       assertValidMigrationHistory(
+        [{ version: "001", filename: "001_wrong.sql" }],
+        migrations,
+      ),
+    /Migration history filename mismatch/,
+  );
+
+  assert.throws(
+    () =>
+      assertValidMigrationHistory(
         [{ version: "002", filename: "002_second.sql" }],
         migrations,
       ),

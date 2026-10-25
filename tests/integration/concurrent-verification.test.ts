@@ -33,10 +33,12 @@ function assertSafeTestDatabase(): asserts databaseName is string {
 
 const verificationSql = `
   WITH current_instance AS MATERIALIZED (
-    SELECT id, status
-    FROM public.database_instances
-    WHERE id = $1
-    FOR UPDATE
+    SELECT di.id, di.status
+    FROM public.database_instances AS di
+    JOIN public.projects AS p ON p.id = di.project_id
+    WHERE di.id = $1
+      AND p.tenant_id = $9
+    FOR UPDATE OF di
   ),
   transitioned AS (
     UPDATE public.database_instances AS di
@@ -76,7 +78,8 @@ function verificationParams(
   instanceId: string,
   ok: boolean,
   code: string,
-): [string, boolean, string, string, string, string, string, string] {
+  tenantId: string,
+): [string, boolean, string, string, string, string, string, string, string] {
   return [
     instanceId,
     ok,
@@ -86,6 +89,7 @@ function verificationParams(
     `database_instance:${instanceId}`,
     ok ? "succeeded" : "failed",
     JSON.stringify({ verification_code: code }),
+    tenantId,
   ];
 }
 
@@ -110,6 +114,8 @@ test(
     let first: PoolClient | undefined;
     let second: PoolClient | undefined;
     let monitor: PoolClient | undefined;
+    let auditMonitor: PoolClient | undefined;
+    let auditMonitorPool: Pool | undefined;
     let transactionOpen = false;
     let fixtureCreated = false;
     let secondRequest:
@@ -126,6 +132,17 @@ test(
       second = await pool.connect();
       monitor = await pool.connect();
 
+      auditMonitorPool = new Pool({
+        host: process.env.CONTROL_MIGRATION_HOST ?? "127.0.0.1",
+        port: Number(process.env.CONTROL_MIGRATION_PORT ?? 55433),
+        user: process.env.CONTROL_MIGRATION_USER,
+        password: process.env.CONTROL_MIGRATION_PASSWORD,
+        database: databaseName,
+        connectionTimeoutMillis: 5000,
+        max: 1,
+      });
+      auditMonitor = await auditMonitorPool.connect();
+
       const identity = await monitor.query(
         "SELECT current_database() AS database_name",
       );
@@ -140,10 +157,21 @@ test(
         ["ppm_atomicity_second"],
       );
 
+      const tenant = await first.query<{ id: string }>(
+        "SELECT id FROM public.tenants WHERE tenant_key = 'legacy'",
+      );
+      assert.ok(tenant.rows[0], "Expected the legacy test tenant to exist");
+      const tenantId = tenant.rows[0].id;
+
       await first.query(
-        `INSERT INTO public.projects (id, project_key, name)
-         VALUES ($1, $2, $3)`,
-        [projectId, `concurrent-test-${suffix}`, "Concurrent verification test"],
+        `INSERT INTO public.projects (id, project_key, name, tenant_id)
+         VALUES ($1, $2, $3, $4)`,
+        [
+          projectId,
+          `concurrent-test-${suffix}`,
+          "Concurrent verification test",
+          tenantId,
+        ],
       );
 
       await first.query(
@@ -160,14 +188,14 @@ test(
 
       const firstResult = await first.query<{ lifecycle_status: string }>(
         verificationSql,
-        verificationParams(instanceId, true, "FIRST_SUCCESS"),
+        verificationParams(instanceId, true, "FIRST_SUCCESS", tenantId),
       );
       assert.equal(firstResult.rows[0]?.lifecycle_status, "ready");
 
       secondRequest = second
         .query<{ lifecycle_status: string }>(
           verificationSql,
-          verificationParams(instanceId, false, "SECOND_FAILURE"),
+          verificationParams(instanceId, false, "SECOND_FAILURE", tenantId),
         )
         .then((result) => ({ rows: result.rows }));
 
@@ -208,7 +236,7 @@ test(
       // A later failure result must not overwrite the terminal 'ready' status.
       const laterResult = await monitor.query<{ lifecycle_status: string }>(
         verificationSql,
-        verificationParams(instanceId, false, "LATER_FAILURE"),
+        verificationParams(instanceId, false, "LATER_FAILURE", tenantId),
       );
       assert.equal(laterResult.rows[0]?.lifecycle_status, "ready");
 
@@ -220,7 +248,7 @@ test(
       );
       assert.equal(finalStatus.rows[0]?.status, "ready");
 
-      const auditResult = await monitor.query<{
+      const auditResult = await auditMonitor!.query<{
         outcome: string;
         details: {
           verification_code: string;
@@ -272,19 +300,19 @@ test(
         await secondRequest.catch(() => {});
       }
 
-      if (fixtureCreated && monitor) {
-        await monitor.query(
+      if (fixtureCreated && auditMonitor) {
+        await auditMonitor.query(
           `DELETE FROM public.audit_events
            WHERE target = $1`,
           [target],
         ).catch(() => {});
 
-        await monitor.query(
+        await auditMonitor.query(
           "DELETE FROM public.database_instances WHERE id = $1",
           [instanceId],
         ).catch(() => {});
 
-        await monitor.query(
+        await auditMonitor.query(
           "DELETE FROM public.projects WHERE id = $1",
           [projectId],
         ).catch(() => {});
@@ -293,6 +321,8 @@ test(
       first?.release();
       second?.release();
       monitor?.release();
+      auditMonitor?.release();
+      await auditMonitorPool?.end();
       await pool.end();
     }
   },

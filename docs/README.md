@@ -576,3 +576,102 @@ Before treating the runner as production-ready, run the unit tests, typecheck,
 build, and integration tests; inspect the complete Git diff (including
 untracked files); and separately review operational permissions, backup and
 restore procedures, and deployment controls.
+
+
+
+## Multi-Tenant User Interface
+
+PostgreSQL Project Manager uses a shared web application for all user types. The interface adapts its navigation, accessible pages, data, and available actions according to the authenticated user's role, tenant membership, project assignments, and effective permissions.
+
+The platform does not require a separate frontend application for each role.
+
+### User Types
+
+| Role | Scope | Responsibilities |
+|---|---|---|
+| Super Admin | Platform-wide | Manage tenants, platform access, and platform operations |
+| Tenant Admin | Assigned tenant | Manage tenant users, projects, memberships, and database registrations |
+| Database Operator | Assigned projects | Perform authorized database verification and operational tasks |
+| Viewer | Assigned projects | Read permitted project, database, monitoring, and history information |
+
+These roles describe the intended access model. Actual capabilities must be enforced by backend authorization rules.
+
+### Shared Application Navigation
+
+The shared application may include the following sections:
+
+- **Dashboard:** Overview of authorized projects, database status, and operational activity.
+- **Tenants:** Platform tenant management, available to Super Admins.
+- **Projects:** Project registration, details, and project assignments.
+- **Database Instances:** Environment-specific database registrations and lifecycle status.
+- **Monitoring:** Database connectivity and operational status.
+- **Migrations:** Migration execution history and outcomes.
+- **Backups:** Backup history, checksums, and restore-test status.
+- **Users & Access:** Tenant memberships, user administration, and project assignments.
+- **Audit Log:** Authorized audit-event history.
+- **Settings:** Role-appropriate tenant or platform settings.
+
+Navigation entries are displayed according to the authenticated user's effective permissions. A visible navigation item or enabled button does not itself grant access.
+
+### Frontend Organization
+
+The existing `apps/admin-web/` directory is the intended location for the administrative frontend. The following structure is a proposed organization to introduce incrementally; it is not a claim that every directory or feature already exists.
+
+```text
+apps/admin-web/
+└── src/
+    ├── app/
+    │   ├── router.tsx
+    │   └── providers.tsx
+    ├── layouts/
+    │   ├── AuthLayout.tsx
+    │   └── DashboardLayout.tsx
+    ├── components/
+    │   ├── ui/
+    │   ├── navigation/
+    │   └── feedback/
+    ├── features/
+    │   ├── auth/
+    │   ├── dashboard/
+    │   ├── tenants/
+    │   ├── users/
+    │   ├── projects/
+    │   ├── database-instances/
+    │   ├── monitoring/
+    │   ├── migrations/
+    │   ├── backups/
+    │   └── audit/
+    ├── hooks/
+    ├── lib/
+    │   ├── api-client.ts
+    │   └── permissions.ts
+    └── styles/
+```
+
+The frontend should consume the existing Fastify API rather than duplicate business logic or database authorization.
+
+### Frontend Security Requirements
+
+- Use the existing session-based authentication model.
+- Preserve CSRF protection for state-changing requests.
+- Validate tenant selection and membership on the server.
+- Restrict project and database data to the user's authorized scope.
+- Enforce permissions on every protected API operation.
+- Do not expose database passwords, session tokens, or internal connection details.
+- Require appropriate confirmation and authorization for sensitive operations.
+
+Frontend permission checks improve usability, but they must never replace server-side authorization.
+
+### UI Implementation Roadmap
+
+1. Inspect the existing `apps/admin-web/` implementation and workspace configuration.
+2. Establish the login page and shared authenticated application layout.
+3. Integrate the current-user and logout endpoints.
+4. Build the dashboard using real API data.
+5. Implement project and database instance screens.
+6. Add role-aware navigation and action controls.
+7. Integrate monitoring, migration history, and backup history as their backend capabilities become available.
+8. Implement tenant and user administration.
+9. Add frontend tests for loading states, errors, authorization-dependent rendering, and session expiry.
+
+Frontend features should be documented as implemented only after their actual code, API integration, and tests have been verified.

@@ -260,8 +260,18 @@ export function assertValidMigrationHistory(
       throw new Error(`Duplicate migration history version: ${row.version}`);
     }
 
-    if (!ordered.some((migration) => migration.version === row.version)) {
+    const migration = ordered.find(
+      (candidate) => candidate.version === row.version,
+    );
+
+    if (!migration) {
       throw new Error(`Applied migration file is missing: ${row.filename}`);
+    }
+
+    if (row.filename !== migration.filename) {
+      throw new Error(
+        `Migration history filename mismatch for version ${row.version}: expected ${migration.filename}, found ${row.filename}`,
+      );
     }
 
     appliedVersions.add(row.version);

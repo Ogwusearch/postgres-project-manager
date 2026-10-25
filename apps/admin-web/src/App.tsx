@@ -1,274 +1,582 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+
+import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 
-const API_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+type Role = "super_admin" | "admin" | "database_operator" | "viewer";
 
-type Project = {
-  id: string;
-  project_key: string;
-  name: string;
-  status: "active" | "inactive" | "archived";
-  created_at: string;
+type Membership = {
+  tenant_id: string;
+  tenant_key: string;
+  tenant_name: string;
+  tenant_status: "active" | "suspended";
+  role: "admin" | "database_operator" | "viewer";
 };
-type Environment = "development" | "staging" | "production";
-type InstanceStatus = "planned" | "provisioning" | "ready" | "failed" | "retired";
-type Instance = {
-  id: string;
-  project_id: string;
-  environment: Environment;
-  database_name: string;
-  server_key: string;
-  status: InstanceStatus;
-  created_at: string;
-};
-type Health = { status: string; database: string };
-type Verification = { ok: boolean; message: string; code: string; durationMs: number; lifecycleStatus: string };
-type View = "Overview" | "Projects" | "Database instances" | "Verification";
-type ApiBody<T> = { data?: T; error?: string; message?: string; [key: string]: unknown };
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  let response: Response;
+type Session = {
+  id: string;
+  email: string;
+  is_super_admin: boolean;
+  memberships: Membership[];
+};
+
+type AuthStatus = "loading" | "authenticated" | "unauthenticated" | "error";
+
+function readCsrfCookie(): string | null {
+  const cookie = document.cookie
+    .split("; ")
+    .find((part) => part.startsWith("ppm_csrf="));
+
+  if (!cookie) return null;
+
   try {
-    response = await fetch(`${API_URL}${path}`, {
-      ...init,
-      headers: { ...(init?.body ? { "Content-Type": "application/json" } : {}), ...init?.headers },
-    });
+    return decodeURIComponent(cookie.slice("ppm_csrf=".length));
   } catch {
-    throw new Error("Cannot reach the API. Check that the backend is running and the API URL is correct.");
+    return null;
   }
-  const body = (await response.json().catch(() => ({}))) as ApiBody<T>;
-  if (!response.ok) throw new Error(body.error || body.message || `Request failed (${response.status})`);
-  return body as T;
 }
 
-function Icon({ name }: { name: string }) {
-  const paths: Record<string, string> = {
-    grid: "M3 3h7v7H3z M14 3h7v7h-7z M14 14h7v7h-7z M3 14h7v7H3z",
-    folder: "M3 6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z",
-    database: "M12 3c4.4 0 8 1.3 8 3s-3.6 3-8 3-8-1.3-8-3 3.6-3 8-3z M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6 M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3",
-    shield: "M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11z M9 12l2 2 4-4",
-    refresh: "M20 7v5h-5 M4 17v-5h5 M5.6 9a7 7 0 0 1 11.6-2L20 12 M4 12l2.8 5a7 7 0 0 0 11.6-2",
-    plus: "M12 5v14 M5 12h14",
-    search: "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z M21 21l-4.3-4.3",
-    arrow: "M7 17 17 7 M7 7h10v10",
-    check: "m5 12 4 4L19 6",
-    warning: "M12 9v4 M12 17h.01 M10.3 3.9 1.8 18.1A2 2 0 0 0 3.5 21h17a2 2 0 0 0 1.7-2.9L13.7 3.9a2 2 0 0 0-3.4 0z",
-    close: "M18 6 6 18 M6 6l12 12",
+async function readApiError(response: Response): Promise<string> {
+  try {
+    const body = await response.json() as { error?: unknown };
+    if (typeof body.error === "string") return body.error;
+  } catch {
+    // Use the generic fallback when the response is not JSON.
+  }
+
+  return `Request failed (${response.status}).`;
+}
+
+
+type Project = {
+  name: string;
+  key: string;
+  environment: string;
+  database: string;
+  status: "Healthy" | "Warning" | "Offline";
+  updated: string;
+};
+
+const projects: Project[] = [
+  {
+    name: "Ogwusearch Engineering",
+    key: "OGW",
+    environment: "Production",
+    database: "ogwusearch_prod",
+    status: "Healthy",
+    updated: "2 minutes ago",
+  },
+  {
+    name: "SolarAudit",
+    key: "SOL",
+    environment: "Development",
+    database: "solar_audit_dev",
+    status: "Healthy",
+    updated: "18 minutes ago",
+  },
+  {
+    name: "Resort Platform",
+    key: "RST",
+    environment: "Production",
+    database: "resort_platform_prod",
+    status: "Warning",
+    updated: "34 minutes ago",
+  },
+];
+
+const instances = [
+  { name: "ogwusearch_prod", project: "Ogwusearch Engineering", env: "Production", status: "Connected", version: "PostgreSQL 16" },
+  { name: "solar_audit_dev", project: "SolarAudit", env: "Development", status: "Connected", version: "PostgreSQL 16" },
+  { name: "resort_platform_prod", project: "Resort Platform", env: "Production", status: "Attention", version: "PostgreSQL 15" },
+];
+
+const navigation = [
+  { section: "WORKSPACE", items: [
+    { label: "Overview", icon: "grid" },
+    { label: "Projects", icon: "layers" },
+    { label: "Databases", icon: "database" },
+  ]},
+  { section: "OPERATIONS", items: [
+    { label: "Migrations", icon: "git" },
+    { label: "Backups", icon: "archive" },
+    { label: "Monitoring", icon: "activity" },
+    { label: "Audit log", icon: "history" },
+  ]},
+  { section: "ADMINISTRATION", items: [
+    { label: "Users & access", icon: "users" },
+    { label: "Settings", icon: "settings" },
+  ]},
+];
+
+const roleLabels: Record<Role, string> = {
+  super_admin: "Super Admin",
+  admin: "Tenant Admin",
+  database_operator: "Database Operator",
+  viewer: "Viewer",
+};
+
+function Icon({ name, size = 18 }: { name: string; size?: number }) {
+  const common = {
+    width: size,
+    height: size,
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.7,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+    "aria-hidden": true as const,
   };
-  return <svg viewBox="0 0 24 24" aria-hidden="true" className="icon"><path d={paths[name] || paths.grid} /></svg>;
+
+  const paths: Record<string, React.ReactNode> = {
+    grid: <><rect x="3" y="3" width="7" height="7" rx="1.5" /><rect x="14" y="3" width="7" height="7" rx="1.5" /><rect x="14" y="14" width="7" height="7" rx="1.5" /><rect x="3" y="14" width="7" height="7" rx="1.5" /></>,
+    layers: <><path d="m12 3 9 5-9 5-9-5 9-5Z" /><path d="m3 12 9 5 9-5" /><path d="m3 16 9 5 9-5" /></>,
+    database: <><ellipse cx="12" cy="5" rx="8" ry="3" /><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5" /><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3" /></>,
+    git: <><circle cx="6" cy="5" r="2" /><circle cx="18" cy="19" r="2" /><circle cx="6" cy="19" r="2" /><path d="M6 7v10M18 17v-2a4 4 0 0 0-4-4H10a4 4 0 0 1-4-4" /></>,
+    archive: <><rect x="3" y="4" width="18" height="4" rx="1" /><path d="M5 8v12h14V8M10 12h4" /></>,
+    activity: <><path d="M3 12h4l3-8 4 16 3-8h4" /></>,
+    history: <><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5M12 7v5l4 2" /></>,
+    users: <><path d="M16 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="10" cy="7" r="4" /><path d="M20 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8" /></>,
+    settings: <><circle cx="12" cy="12" r="3" /><path d="m19.4 15 .1.1 1.1 1.9-2 3.4-2.2-.5a8 8 0 0 1-2 .9L13.8 23h-3.6l-.6-2.2a8 8 0 0 1-2-.9l-2.2.5-2-3.4 1.1-1.9a8 8 0 0 1 0-2.1l-1.1-1.9 2-3.4 2.2.5a8 8 0 0 1 2-.9L10.2 5h3.6l.6 2.2a8 8 0 0 1 2 .9l2.2-.5 2 3.4-1.1 1.9a8 8 0 0 1-.1 2.1Z" transform="translate(0 -2) scale(1 .95)" /></>,
+    search: <><circle cx="10.5" cy="10.5" r="6.5" /><path d="m16 16 5 5" /></>,
+    bell: <><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" /></>,
+    plus: <><path d="M12 5v14M5 12h14" /></>,
+    arrow: <><path d="M5 12h14M13 6l6 6-6 6" /></>,
+    chevron: <path d="m9 18 6-6-6-6" />,
+    more: <><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></>,
+    shield: <><path d="M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11Z" /><path d="m9 12 2 2 4-4" /></>,
+  };
+
+  return <svg {...common}>{paths[name] ?? paths.grid}</svg>;
 }
 
 function Status({ value }: { value: string }) {
-  const tone = ["ready", "active", "connected", "succeeded"].includes(value)
+  const kind = value === "Healthy" || value === "Connected"
     ? "success"
-    : ["failed", "archived", "unavailable", "error"].includes(value)
-      ? "danger"
-      : value === "production" ? "production" : ["provisioning", "staging"].includes(value) ? "warning" : "neutral";
-  return <span className={`status status-${tone}`}><span className="status-dot" />{value.replaceAll("_", " ")}</span>;
-}
-function shortId(id: string) { return id ? `${id.slice(0, 8)}…` : "—"; }
-function formatDate(value: string) {
-  if (!value) return "—";
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "—" : date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+    : value === "Warning" || value === "Attention"
+      ? "warning"
+      : "neutral";
+
+  return <span className={`status status-${kind}`}><span className="status-dot" />{value}</span>;
 }
 
 function App() {
-  const [view, setView] = useState<View>("Overview");
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [instances, setInstances] = useState<Instance[]>([]);
-  const [health, setHealth] = useState<Health | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [search, setSearch] = useState("");
-  const [busyId, setBusyId] = useState("");
-  const [notice, setNotice] = useState("");
-  const [noticeError, setNoticeError] = useState(false);
-  const [verification, setVerification] = useState<Record<string, Verification>>({});
-  const [showProjectForm, setShowProjectForm] = useState(false);
-  const [showInstanceForm, setShowInstanceForm] = useState(false);
-  const [projectKey, setProjectKey] = useState("");
-  const [projectName, setProjectName] = useState("");
-  const [creatingProject, setCreatingProject] = useState(false);
-  const [creatingInstance, setCreatingInstance] = useState(false);
-  const [provisioningId, setProvisioningId] = useState("");
-  const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  const [instanceProjectId, setInstanceProjectId] = useState("");
-  const [instanceEnvironment, setInstanceEnvironment] = useState<Environment>("development");
-  const [databaseName, setDatabaseName] = useState("");
-  const [serverKey, setServerKey] = useState("local-postgres");
+  const [authStatus, setAuthStatus] = useState<AuthStatus>("loading");
+  const [session, setSession] = useState<Session | null>(null);
+  const [selectedTenantId, setSelectedTenantId] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginBusy, setLoginBusy] = useState(false);
 
-  const loadData = useCallback(async (silent = false) => {
-    if (!silent) setLoading(true);
-    setError("");
-    const [healthResult, projectResult, instanceResult] = await Promise.allSettled([
-      request<Health>("/health"),
-      request<{ data: Project[] }>("/api/projects?limit=100&offset=0"),
-      request<{ data: Instance[] }>("/api/database-instances"),
-    ]);
-    if (healthResult.status === "fulfilled") setHealth(healthResult.value);
-    else setHealth(null);
-    if (projectResult.status === "fulfilled") setProjects(projectResult.value.data || []);
-    if (instanceResult.status === "fulfilled") setInstances(instanceResult.value.data || []);
-    const failures = [healthResult, projectResult, instanceResult]
-      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-      .map((result) => result.reason instanceof Error ? result.reason.message : "A request failed.");
-    if (failures.length) setError(failures.join(" "));
-    setLoading(false);
-  }, []);
+  const [activePage, setActivePage] = useState("Overview");
+  const [search, setSearch] = useState("");
+  const [environment, setEnvironment] = useState("All environments");
 
   useEffect(() => {
     let cancelled = false;
 
-    void Promise.resolve().then(() => {
-      if (!cancelled) void loadData();
-    });
+    async function restoreSession() {
+      try {
+        const response = await fetch("/api/auth/me", {
+          credentials: "include",
+        });
 
-    return () => {
-      cancelled = true;
-    };
-  }, [loadData]);
+        if (response.status === 401) {
+          if (!cancelled) setAuthStatus("unauthenticated");
+          return;
+        }
 
-  const projectById = useMemo(() => new Map(projects.map((project) => [project.id, project])), [projects]);
-  const visibleProjects = useMemo(() => {
-    const query = search.toLowerCase().trim();
-    return projects.filter((project) => !query || project.name.toLowerCase().includes(query) || project.project_key.toLowerCase().includes(query));
-  }, [projects, search]);
-  const visibleInstances = useMemo(() => {
-    const query = search.toLowerCase().trim();
-    return instances.filter((instance) => {
-      const projectName = projectById.get(instance.project_id)?.name || "";
-      return !query || [instance.database_name, instance.server_key, instance.environment, instance.status, projectName]
-        .some((value) => value.toLowerCase().includes(query));
-    });
-  }, [instances, projectById, search]);
-  const readyCount = instances.filter((instance) => instance.status === "ready").length;
-  const failedCount = instances.filter((instance) => instance.status === "failed").length;
+        if (!response.ok) {
+          throw new Error(await readApiError(response));
+        }
 
-  function showNotice(message: string, isError = false) { setNotice(message); setNoticeError(isError); }
-  function changeView(next: View) { setView(next); setSearch(""); setMobileNavOpen(false); }
+        const body = await response.json() as { data: Session };
+        if (cancelled) return;
 
-  async function verifyInstance(instance: Instance) {
-    setBusyId(instance.id); setNotice("");
+        setSession(body.data);
+        setSelectedTenantId(body.data.memberships[0]?.tenant_id ?? "");
+        setAuthError("");
+        setAuthStatus("authenticated");
+      } catch {
+        if (!cancelled) {
+          setAuthError("Unable to verify your session. Please try signing in again.");
+          setAuthStatus("error");
+        }
+      }
+    }
+
+    void restoreSession();
+    return () => { cancelled = true; };
+  }, []);
+
+  const selectedMembership = session?.memberships.find(
+    (membership) => membership.tenant_id === selectedTenantId,
+  );
+
+  const role: Role = session?.is_super_admin
+    ? "super_admin"
+    : selectedMembership?.role ?? "viewer";
+
+  const visibleProjects = useMemo(() => projects.filter((project) => {
+    const matchesSearch = `${project.name} ${project.database}`.toLowerCase().includes(search.toLowerCase());
+    const matchesEnvironment = environment === "All environments" || project.environment === environment;
+    return matchesSearch && matchesEnvironment;
+  }), [search, environment]);
+
+  const canManage = role === "super_admin" || role === "admin";
+  const isViewer = role === "viewer";
+
+  async function handleLogin(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setLoginBusy(true);
+    setAuthError("");
+
     try {
-      const body = await request<{ data?: Verification }>(`/api/database-instances/${instance.id}/verify`, { method: "POST" });
-      if (body.data) setVerification((previous) => ({ ...previous, [instance.id]: body.data! }));
-      showNotice(`Verification completed for ${instance.database_name}.`);
-      await loadData(true);
-    } catch (err) {
-      showNotice(err instanceof Error ? err.message : "Verification request failed.", true);
-    } finally { setBusyId(""); }
-  }
-
-  async function createProject(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setCreatingProject(true); setNotice("");
-    try {
-      await request("/api/projects", { method: "POST", body: JSON.stringify({ project_key: projectKey.trim(), name: projectName.trim(), status: "active" }) });
-      setProjectKey(""); setProjectName(""); setShowProjectForm(false); changeView("Projects");
-      showNotice("Project registered successfully."); await loadData(true);
-    } catch (err) { showNotice(err instanceof Error ? err.message : "Could not create project.", true); }
-    finally { setCreatingProject(false); }
-  }
-
-  async function createInstance(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setCreatingInstance(true); setNotice("");
-    try {
-      // The backend scopes instance registration to the project in the URL.
-      await request(`/api/projects/${encodeURIComponent(instanceProjectId)}/database-instances`, {
+      const response = await fetch("/api/auth/login", {
         method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          environment: instanceEnvironment,
-          database_name: databaseName.trim(),
-          server_key: serverKey.trim(),
+          email: loginEmail,
+          password: loginPassword,
         }),
       });
-      setDatabaseName(""); setInstanceProjectId(""); setInstanceEnvironment("development"); setServerKey("local-postgres");
-      setShowInstanceForm(false); changeView("Database instances");
-      showNotice("Database instance registered successfully."); await loadData(true);
-    } catch (err) { showNotice(err instanceof Error ? err.message : "Could not register database instance.", true); }
-    finally { setCreatingInstance(false); }
-  }
 
-  async function provisionInstance(instance: Instance) {
-    if (instance.environment !== "development") {
-      showNotice("Provisioning is currently restricted to development instances.", true); return;
+      if (!response.ok) {
+        throw new Error(await readApiError(response));
+      }
+
+      const profileResponse = await fetch("/api/auth/me", {
+        credentials: "include",
+      });
+
+      if (!profileResponse.ok) {
+        throw new Error(
+          profileResponse.status === 401
+            ? "Sign-in succeeded, but the session could not be verified. Please try again."
+            : await readApiError(profileResponse),
+        );
+      }
+
+      const body = await profileResponse.json() as { data: Session };
+      setSession(body.data);
+      setSelectedTenantId(body.data.memberships[0]?.tenant_id ?? "");
+      setLoginPassword("");
+      setAuthStatus("authenticated");
+    } catch (error) {
+      setAuthError(
+        error instanceof Error ? error.message : "Unable to sign in.",
+      );
+      setAuthStatus("unauthenticated");
+    } finally {
+      setLoginBusy(false);
     }
-    const confirmed = window.confirm(`Provision database "${instance.database_name}" for the ${instance.environment} environment? This will ask the backend to create the database if it does not already exist.`);
-    if (!confirmed) return;
-    setProvisioningId(instance.id); setNotice("");
-    try {
-      await request(`/api/database-instances/${instance.id}/provision`, { method: "POST" });
-      showNotice(`Provisioning request completed for ${instance.database_name}.`);
-      await loadData(true);
-    } catch (err) {
-      showNotice(err instanceof Error ? err.message : "Provisioning request failed.", true);
-      await loadData(true);
-    } finally { setProvisioningId(""); }
   }
 
-  const navItems: { label: View; icon: string }[] = [
-    { label: "Overview", icon: "grid" }, { label: "Projects", icon: "folder" },
-    { label: "Database instances", icon: "database" }, { label: "Verification", icon: "shield" },
-  ];
+  async function handleLogout() {
+    setAuthError("");
 
-  return <div className="app-shell">
-    <aside className={`sidebar ${mobileNavOpen ? "sidebar-open" : ""}`}>
-      <a className="brand" href="#overview" onClick={(event) => { event.preventDefault(); changeView("Overview"); }}>
-        <span className="brand-mark">P<span>.</span></span><span className="brand-copy"><strong>PG CONTROL</strong><small>PROJECT MANAGER</small></span>
-      </a>
-      <div className="workspace-label">WORKSPACE</div>
-      <div className="workspace-switch"><span className="workspace-avatar">P</span><span><strong>Platform control</strong><small>Default environment</small></span><span className="switch-chevron">⌄</span></div>
-      <div className="nav-label">MANAGEMENT</div>
-      <nav className="main-nav" aria-label="Main navigation">{navItems.map((item) => <button key={item.label} className={`nav-item ${view === item.label ? "active" : ""}`} onClick={() => changeView(item.label)}><Icon name={item.icon} /><span>{item.label}</span>{item.label === "Database instances" && instances.length > 0 && <span className="nav-count">{instances.length}</span>}</button>)}</nav>
-      <div className="sidebar-bottom"><div className="connection-card"><span className={`connection-indicator ${health ? "online" : "offline"}`} /><div><strong>{health ? "API reachable" : "API disconnected"}</strong><small>{health?.database || "Check connection"}</small></div></div><div className="sidebar-footer"><span className="footer-symbol">⌘</span><span><strong>PG Control</strong><small>Management console</small></span><span className="version">v1.1</span></div></div>
-    </aside>
+    try {
+      const csrfToken = readCsrfCookie();
+      if (!csrfToken) {
+        throw new Error("The security token is missing. Refresh the page and try again.");
+      }
 
-    {mobileNavOpen && <button className="mobile-backdrop" aria-label="Close navigation" onClick={() => setMobileNavOpen(false)} />}
-    <main className="main-panel">
-      <header className="topbar"><div className="topbar-left"><button className="mobile-menu-button" aria-label="Toggle navigation" onClick={() => setMobileNavOpen((open) => !open)}><span /><span /><span /></button><div className="breadcrumbs"><span>Workspace</span><span className="crumb-slash">/</span><strong>{view}</strong></div></div><div className="topbar-actions"><span className={`api-pill ${health ? "is-online" : "is-offline"}`}><span className="status-dot" />{health ? "API connected" : "API offline"}</span><button className="icon-button" aria-label="Refresh data" title="Refresh data" onClick={() => void loadData()} disabled={loading}><Icon name="refresh" /></button><span className="user-avatar">OG</span></div></header>
-      <div className="content">
-        <section className="page-heading"><div><div className="eyebrow"><span className="eyebrow-line" />DATABASE OPERATIONS</div><h1>{view === "Overview" ? "Control center" : view}</h1><p className="page-description">{view === "Overview" ? "A clear view of your registered projects and database environments." : view === "Projects" ? "Manage the projects registered with your platform." : view === "Verification" ? "Verify database connectivity and review the latest results." : "Register, provision, verify, and monitor database environments."}</p></div><div className="heading-actions"><span className="last-updated"><span className="live-dot" />API DATA</span><div className="heading-button-group"><button className="button button-secondary" onClick={() => { if (!projects.length) { changeView("Projects"); showNotice("Register a project before registering a database instance.", true); } else setShowInstanceForm(true); }}><Icon name="database" />Add instance</button><button className="button button-primary" onClick={() => setShowProjectForm(true)}><Icon name="plus" />New project</button></div></div></section>
+      const response = await fetch("/api/auth/logout", {
+        method: "POST",
+        credentials: "include",
+        headers: { "X-CSRF-Token": csrfToken },
+      });
 
-        {error && <div className="alert alert-error" role="alert"><Icon name="warning" /><div><strong>Some platform data could not be loaded</strong><p>{error}</p><small>API base URL: {API_URL}</small></div><button className="button button-quiet" onClick={() => void loadData()}>Retry</button></div>}
-        {notice && <div className={`alert ${noticeError ? "alert-error" : "alert-notice"}`} role="status"><Icon name={noticeError ? "warning" : "check"} /><p>{notice}</p><button className="dismiss" aria-label="Dismiss message" onClick={() => setNotice("")}><Icon name="close" /></button></div>}
+      if (!response.ok) {
+        throw new Error(await readApiError(response));
+      }
 
-        {showProjectForm && <section className="panel create-panel"><div className="panel-heading"><div><h2>Register a project</h2><p>Register a project in the platform registry.</p></div><button className="dismiss" onClick={() => setShowProjectForm(false)} aria-label="Close form"><Icon name="close" /></button></div><form className="project-form" onSubmit={createProject}><label>Project name<input required minLength={2} maxLength={120} value={projectName} onChange={(event) => setProjectName(event.target.value)} placeholder="e.g. SolarAudit" /></label><label>Project key<input required pattern="[a-zA-Z0-9][a-zA-Z0-9_\-]*" maxLength={60} value={projectKey} onChange={(event) => setProjectKey(event.target.value)} placeholder="e.g. solar-audit" /><small>Letters, numbers, hyphens and underscores.</small></label><div className="form-actions"><button type="button" className="button button-secondary" onClick={() => setShowProjectForm(false)}>Cancel</button><button className="button button-primary" disabled={creatingProject}>{creatingProject ? "Registering…" : "Register project"}</button></div></form></section>}
+      setSession(null);
+      setSelectedTenantId("");
+      setLoginPassword("");
+      setAuthStatus("unauthenticated");
+    } catch (error) {
+      setAuthError(
+        error instanceof Error ? error.message : "Unable to sign out.",
+      );
+    }
+  }
 
-        {showInstanceForm && <section className="panel create-panel"><div className="panel-heading"><div><h2>Register database instance</h2><p>Add an environment to a registered project. Registration does not create the database.</p></div><button className="dismiss" onClick={() => setShowInstanceForm(false)} aria-label="Close form"><Icon name="close" /></button></div><form className="project-form instance-form" onSubmit={createInstance}>
-          <label>Project<select required value={instanceProjectId} onChange={(event) => setInstanceProjectId(event.target.value)}><option value="">Choose a project</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name} ({project.project_key})</option>)}</select></label>
-          <label>Environment<select required value={instanceEnvironment} onChange={(event) => setInstanceEnvironment(event.target.value as Environment)}><option value="development">Development</option><option value="staging">Staging</option><option value="production">Production</option></select></label>
-          <label>Database name<input required pattern="[a-zA-Z_][a-zA-Z0-9_]{0,62}" maxLength={63} value={databaseName} onChange={(event) => setDatabaseName(event.target.value)} placeholder="e.g. solar_audit_dev" /><small>Starts with a letter or underscore; max 63 characters.</small></label>
-          <label>Trusted server key<input required maxLength={100} value={serverKey} onChange={(event) => setServerKey(event.target.value)} placeholder="local-postgres" /><small>Must match a server key configured by the backend.</small></label>
-          <div className="form-hint"><Icon name="shield" /><span>Server credentials stay on the backend. Do not enter passwords here. Provisioning is currently enabled for development instances only.</span></div>
-          <div className="form-actions"><button type="button" className="button button-secondary" onClick={() => setShowInstanceForm(false)}>Cancel</button><button className="button button-primary" disabled={creatingInstance || !projects.length}>{creatingInstance ? "Registering…" : "Register instance"}</button></div>
-        </form></section>}
+  if (authStatus === "loading") {
+    return (
+      <main className="auth-screen">
+        <section className="auth-card" aria-live="polite">
+          <span className="brand-mark"><Icon name="database" size={23} /></span>
+          <h1>pgcontrol</h1>
+          <p>Checking your session…</p>
+        </section>
+      </main>
+    );
+  }
 
-        {view === "Overview" && <><section className="metric-grid"><MetricCard icon="folder" tone="purple" label="REGISTERED PROJECTS" value={loading ? "—" : projects.length} foot="Projects in your registry" /><MetricCard icon="database" tone="blue" label="DATABASE INSTANCES" value={loading ? "—" : instances.length} foot="Across all environments" /><MetricCard icon="check" tone="green" label="READY" value={loading ? "—" : readyCount} foot="Ready lifecycle state" /><MetricCard icon="warning" tone="red" label="FAILED" value={loading ? "—" : failedCount} foot="Requires investigation" /></section>
-          <section className="panel"><div className="panel-heading"><div><h2>Database instances</h2><p>Recent environments registered across your projects.</p></div><button className="button button-secondary" onClick={() => changeView("Database instances")}>View all <Icon name="arrow" /></button></div><InstanceTable instances={[...instances].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at)).slice(0, 5)} projectById={projectById} loading={loading} busyId={busyId} provisioningId={provisioningId} onVerify={verifyInstance} onProvision={provisionInstance} verification={verification} /></section>
-          <section className="panel"><div className="panel-heading"><div><h2>Registered projects</h2><p>Projects connected to this management workspace.</p></div><button className="button button-secondary" onClick={() => changeView("Projects")}>View all <Icon name="arrow" /></button></div><ProjectTable projects={projects.slice(0, 5)} loading={loading} /></section></>}
+  if (authStatus !== "authenticated") {
+    return (
+      <main className="auth-screen">
+        <form className="auth-card" onSubmit={handleLogin}>
+          <span className="brand-mark"><Icon name="database" size={23} /></span>
+          <p className="eyebrow">DATABASE PLATFORM</p>
+          <h1>Sign in to pgcontrol</h1>
+          <p className="subtitle">Use your platform account to continue.</p>
 
-        {view === "Projects" && <section className="panel"><div className="panel-heading table-toolbar"><div><h2>Project registry</h2><p>{projects.length} registered project{projects.length === 1 ? "" : "s"}</p></div><label className="search-box"><Icon name="search" /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search projects…" /></label></div><ProjectTable projects={visibleProjects} loading={loading} /></section>}
-        {(view === "Database instances" || view === "Verification") && <section className="panel"><div className="panel-heading table-toolbar"><div><h2>{view === "Verification" ? "Connectivity checks" : "Instance registry"}</h2><p>{visibleInstances.length} instance{visibleInstances.length === 1 ? "" : "s"} found</p></div><label className="search-box"><Icon name="search" /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search databases…" /></label></div><InstanceTable instances={visibleInstances} projectById={projectById} loading={loading} busyId={busyId} provisioningId={provisioningId} onVerify={verifyInstance} onProvision={provisionInstance} verification={verification} /></section>}
-        <footer className="page-footer"><span><span className="footer-live" />POSTGRES PROJECT MANAGER</span><span>Data served by your configured API</span></footer>
-      </div>
-    </main>
-  </div>;
+          {authError && <p className="auth-error" role="alert">{authError}</p>}
+
+          <label className="auth-field">
+            Email
+            <input
+              type="email"
+              autoComplete="username"
+              required
+              maxLength={254}
+              value={loginEmail}
+              onChange={(event) => setLoginEmail(event.target.value)}
+            />
+          </label>
+
+          <label className="auth-field">
+            Password
+            <input
+              type="password"
+              autoComplete="current-password"
+              required
+              maxLength={1024}
+              value={loginPassword}
+              onChange={(event) => setLoginPassword(event.target.value)}
+            />
+          </label>
+
+          <button className="primary-button auth-submit" type="submit" disabled={loginBusy}>
+            {loginBusy ? "Signing in…" : "Sign in"}
+          </button>
+        </form>
+      </main>
+    );
+  }
+
+  if (!session) {
+    return (
+      <main className="auth-screen">
+        <section className="auth-card">
+          <h1>Session unavailable</h1>
+          <p className="subtitle">
+            Your session could not be loaded. Return to sign in and try again.
+          </p>
+          <button
+            className="secondary-button"
+            onClick={() => {
+              setSession(null);
+              setAuthStatus("unauthenticated");
+              setAuthError("");
+            }}
+          >
+            Return to sign in
+          </button>
+        </section>
+      </main>
+    );
+  }
+
+  if (!selectedTenantId || !selectedMembership) {
+    return (
+      <main className="auth-screen">
+        <section className="auth-card">
+          <span className="brand-mark"><Icon name="shield" size={23} /></span>
+          <h1>No workspace available</h1>
+          <p className="subtitle">
+            Your account has no available tenant membership. Ask a platform administrator
+            to grant access before opening workspace data.
+          </p>
+          {authError && <p className="auth-error" role="alert">{authError}</p>}
+          <button className="secondary-button" onClick={() => void handleLogout()}>
+            Sign out
+          </button>
+        </section>
+      </main>
+    );
+  }
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <a className="brand" href="#overview" onClick={() => setActivePage("Overview")}>
+          <span className="brand-mark"><Icon name="database" size={23} /></span>
+          <span className="brand-copy"><strong>pg<span>control</span></strong><small>DATABASE PLATFORM</small></span>
+        </a>
+
+        <div className="workspace-switcher">
+          <span className="workspace-avatar">P</span>
+          <span className="workspace-copy">
+            <strong>{selectedMembership.tenant_name}</strong>
+            <small>{selectedMembership.tenant_key}</small>
+          </span>
+          {session.memberships.length > 1 && (
+            <select
+              aria-label="Select workspace"
+              value={selectedTenantId}
+              onChange={(event) => setSelectedTenantId(event.target.value)}
+            >
+              {session.memberships.map((membership) => (
+                <option key={membership.tenant_id} value={membership.tenant_id}>
+                  {membership.tenant_name}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+
+        <nav className="sidebar-nav" aria-label="Main navigation">
+          {navigation.map((group) => (
+            <div className="nav-group" key={group.section}>
+              <p className="nav-heading">{group.section}</p>
+              {group.items.map((item) => (
+                <button
+                  key={item.label}
+                  className={`nav-link ${activePage === item.label ? "active" : ""}`}
+                  onClick={() => setActivePage(item.label)}
+                >
+                  <Icon name={item.icon} />
+                  <span>{item.label}</span>
+                  {item.label === "Backups" && <span className="nav-count">2</span>}
+                </button>
+              ))}
+            </div>
+          ))}
+        </nav>
+
+        <div className="sidebar-bottom">
+          <div className="support-card">
+            <span className="support-icon"><Icon name="shield" size={17} /></span>
+            <strong>Security overview</strong>
+            <p>Keep your databases protected with least-privilege access.</p>
+            <button onClick={() => setActivePage("Users & access")}>Review access <Icon name="arrow" size={14} /></button>
+          </div>
+          <div className="sidebar-user">
+            <div className="user-avatar">{session.email.slice(0, 1).toUpperCase()}</div>
+            <div className="user-copy">
+              <strong>{session.email}</strong>
+              <small>{roleLabels[role]}</small>
+            </div>
+            <button
+              className="icon-button user-menu-button"
+              aria-label="Sign out"
+              title="Sign out"
+              onClick={() => void handleLogout()}
+            >
+              <Icon name="more" />
+            </button>
+          </div>
+        </div>
+      </aside>
+
+      <main className="main-area">
+        <header className="topbar">
+          <div className="breadcrumbs"><span>Workspace</span><Icon name="chevron" size={14} /><strong>{activePage}</strong></div>
+          <div className="topbar-actions">
+            <label className="search-box">
+              <Icon name="search" size={17} />
+              <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search projects..." aria-label="Search projects" />
+              <kbd>⌘ K</kbd>
+            </label>
+            <button className="icon-button notification-button" aria-label="Notifications"><Icon name="bell" /></button>
+            <div className="topbar-divider" />
+            <button className="topbar-profile" onClick={() => void handleLogout()} title="Sign out">
+              <span className="user-avatar small">{session.email.slice(0, 1).toUpperCase()}</span>
+              <span><strong>{session.email}</strong><small>{roleLabels[role]} · Sign out</small></span>
+              <Icon name="chevron" size={14} />
+            </button>
+          </div>
+        </header>
+
+        <div className="page-content">
+          <div className="demo-banner"><span className="demo-dot" /> DEMO PREVIEW <span>Sample data · Not connected to the API</span></div>
+
+          {activePage === "Overview" ? (
+            <>
+              <section className="page-heading">
+                <div><p className="eyebrow">MONDAY, OCTOBER 21</p><h1>Good morning<span>,</span> welcome back.</h1><p className="subtitle">Here's what's happening across your database infrastructure.</p></div>
+                {canManage && <button className="primary-button" onClick={() => setActivePage("Projects")}><Icon name="plus" size={17} /> New project</button>}
+              </section>
+
+              <section className="metric-grid" aria-label="Platform metrics">
+                <article className="metric-card">
+                  <div className="metric-top"><span>Total projects</span><span className="metric-icon violet"><Icon name="layers" /></span></div>
+                  <div className="metric-value">12</div><div className="metric-foot"><span className="trend-up">↗ 2</span><span>from last month</span></div>
+                  <div className="metric-sparkline spark-violet"><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /></div>
+                </article>
+                <article className="metric-card">
+                  <div className="metric-top"><span>Database instances</span><span className="metric-icon blue"><Icon name="database" /></span></div>
+                  <div className="metric-value">28</div><div className="metric-foot"><span className="metric-muted">Across all environments</span></div>
+                  <div className="metric-sparkline spark-blue"><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /></div>
+                </article>
+                <article className="metric-card">
+                  <div className="metric-top"><span>Healthy instances</span><span className="metric-icon green"><Icon name="activity" /></span></div>
+                  <div className="metric-value">26<span className="metric-total">/28</span></div><div className="metric-foot"><span className="trend-up">92.8%</span><span>operational</span></div>
+                  <div className="progress-track"><span style={{ width: "92.8%" }} /></div>
+                </article>
+                <article className="metric-card">
+                  <div className="metric-top"><span>Backups today</span><span className="metric-icon amber"><Icon name="archive" /></span></div>
+                  <div className="metric-value">8</div><div className="metric-foot"><span className="metric-muted">Last backup 14 min ago</span></div>
+                  <div className="backup-bars">{[30, 55, 42, 78, 50, 90, 65, 100, 68, 84, 58, 75].map((height, index) => <i key={index} style={{ height: `${height}%` }} />)}</div>
+                </article>
+              </section>
+
+              <section className="content-grid">
+                <article className="panel projects-panel">
+                  <div className="panel-heading"><div><h2>Projects</h2><p>Manage your connected project environments</p></div><button className="text-button" onClick={() => setActivePage("Projects")}>View all <Icon name="arrow" size={15} /></button></div>
+                  <div className="table-toolbar">
+                    <span className="result-count">{visibleProjects.length} projects shown</span>
+                    <select value={environment} onChange={(event) => setEnvironment(event.target.value)} aria-label="Filter by environment">
+                      <option>All environments</option><option>Development</option><option>Production</option>
+                    </select>
+                  </div>
+                  <div className="table-scroll"><table><thead><tr><th>PROJECT</th><th>ENVIRONMENT</th><th>STATUS</th><th>LAST ACTIVITY</th><th /></tr></thead><tbody>
+                    {visibleProjects.map((project) => <tr key={project.key}>
+                      <td><div className="project-cell"><span className={`project-avatar avatar-${project.key.toLowerCase()}`}>{project.key.slice(0, 1)}</span><span><strong>{project.name}</strong><small>{project.database}</small></span></div></td>
+                      <td><span className={`environment-pill ${project.environment === "Production" ? "production" : "development"}`}>{project.environment}</span></td>
+                      <td><Status value={project.status} /></td><td className="activity-time">{project.updated}</td>
+                      <td><button className="row-action" aria-label={`Open ${project.name}`} onClick={() => setActivePage("Databases")}><Icon name="chevron" size={16} /></button></td>
+                    </tr>)}
+                    {visibleProjects.length === 0 && <tr><td colSpan={5} className="empty-state">No projects match your search.</td></tr>}
+                  </tbody></table></div>
+                  <div className="panel-footer"><span>Showing sample projects</span><button onClick={() => setActivePage("Projects")}>All projects <Icon name="arrow" size={14} /></button></div>
+                </article>
+
+                <article className="panel health-panel">
+                  <div className="panel-heading"><div><h2>Infrastructure health</h2><p>Current instance status</p></div><button className="icon-button subtle" aria-label="More health options"><Icon name="more" /></button></div>
+                  <div className="health-score"><div className="health-ring"><div><strong>93<span>%</span></strong><small>HEALTHY</small></div></div><div className="health-summary"><strong>Everything looks good</strong><p>Most database instances are operating normally.</p><span className="health-updated"><span className="status-dot" /> Updated just now (demo)</span></div></div>
+                  <div className="health-breakdown"><div><span><i className="legend-dot healthy" /> Healthy</span><strong>26</strong></div><div><span><i className="legend-dot warning" /> Needs attention</span><strong>2</strong></div><div><span><i className="legend-dot offline" /> Offline</span><strong>0</strong></div></div>
+                  <button className="health-link" onClick={() => setActivePage("Monitoring")}>View monitoring <Icon name="arrow" size={15} /></button>
+                </article>
+              </section>
+
+              <section className="panel instances-panel">
+                <div className="panel-heading"><div><h2>Database instances</h2><p>Recently accessed database environments</p></div><button className="text-button" onClick={() => setActivePage("Databases")}>Manage instances <Icon name="arrow" size={15} /></button></div>
+                <div className="table-scroll"><table><thead><tr><th>DATABASE INSTANCE</th><th>PROJECT</th><th>ENVIRONMENT</th><th>ENGINE</th><th>STATUS</th><th /></tr></thead><tbody>
+                  {instances.map((instance) => <tr key={instance.name}><td><div className="database-cell"><span className="database-symbol"><Icon name="database" size={17} /></span><strong>{instance.name}</strong></div></td><td>{instance.project}</td><td>{instance.env}</td><td><span className="engine-label"><span />{instance.version}</span></td><td><Status value={instance.status} /></td><td><button className="row-action" aria-label={`Open ${instance.name}`} onClick={() => setActivePage("Databases")}><Icon name="chevron" size={16} /></button></td></tr>)}
+                </tbody></table></div>
+              </section>
+              <footer className="page-footer"><span>pgcontrol <span>·</span> Database management platform</span><span><i className="status-dot" /> Signed in as {session.email}</span></footer>
+            </>
+          ) : (
+            <section className="placeholder-page">
+              <span className="placeholder-icon"><Icon name={navigation.flatMap((group) => group.items).find((item) => item.label === activePage)?.icon ?? "grid"} size={25} /></span>
+              <p className="eyebrow">WORKSPACE / {activePage.toUpperCase()}</p>
+              <h1>{activePage}</h1>
+              <p className="subtitle">This section is part of the planned administration interface.</p>
+              <div className="placeholder-card"><strong>{activePage} is not connected yet</strong><p>The dashboard currently uses sample data. This page needs a matching backend endpoint and authorization checks before it can display real information or perform operations.</p><button className="secondary-button" onClick={() => setActivePage("Overview")}>Back to overview</button></div>
+            </section>
+          )}
+
+          {isViewer && <div className="viewer-note"><Icon name="shield" size={16} /> Viewer preview: management actions are hidden. Server-side permissions must still be enforced.</div>}
+        </div>
+      </main>
+    </div>
+  );
 }
 
-function MetricCard({ icon, tone, label, value, foot }: { icon: string; tone: string; label: string; value: string | number; foot: string }) {
-  return <article className="metric-card"><div className="metric-top"><span className={`metric-icon metric-${tone}`}><Icon name={icon} /></span><span className="metric-label">{label}</span></div><div className="metric-value">{value}</div><div className="metric-foot"><span className={`metric-foot-dot ${tone}-dot`} />{foot}</div></article>;
-}
-function ProjectTable({ projects, loading }: { projects: Project[]; loading: boolean }) {
-  if (loading) return <div className="table-state"><span className="spinner" />Loading projects…</div>;
-  if (!projects.length) return <div className="table-state"><span className="empty-icon"><Icon name="folder" /></span><strong>No projects found</strong><span>Register a project to get started.</span></div>;
-  return <div className="table-scroll"><table><thead><tr><th>PROJECT</th><th>PROJECT KEY</th><th>STATUS</th><th>CREATED</th><th>IDENTIFIER</th></tr></thead><tbody>{projects.map((project) => <tr key={project.id}><td><div className="table-primary"><span className="project-avatar">{project.name.slice(0, 1).toUpperCase()}</span><strong>{project.name}</strong></div></td><td><code className="code-chip">{project.project_key}</code></td><td><Status value={project.status} /></td><td className="muted-cell">{formatDate(project.created_at)}</td><td><code className="id-code">{shortId(project.id)}</code></td></tr>)}</tbody></table></div>;
-}
-function InstanceTable({ instances, projectById, loading, busyId, provisioningId, onVerify, onProvision, verification = {} }: { instances: Instance[]; projectById: Map<string, Project>; loading: boolean; busyId: string; provisioningId: string; onVerify: (instance: Instance) => void; onProvision: (instance: Instance) => void; verification?: Record<string, Verification> }) {
-  if (loading) return <div className="table-state"><span className="spinner" />Loading database instances…</div>;
-  if (!instances.length) return <div className="table-state"><span className="empty-icon"><Icon name="database" /></span><strong>No database instances found</strong><span>Register an instance for a project to start managing its lifecycle.</span></div>;
-  return <div className="table-scroll"><table><thead><tr><th>DATABASE</th><th>PROJECT</th><th>ENVIRONMENT</th><th>LIFECYCLE</th><th>CREATED</th><th>ACTIONS</th></tr></thead><tbody>{instances.map((instance) => {
-    const result = verification[instance.id]; const project = projectById.get(instance.project_id); const isBusy = busyId === instance.id; const isProvisioning = provisioningId === instance.id;
-    return <tr key={instance.id}><td><div className="table-primary"><span className="database-avatar"><Icon name="database" /></span><span><strong>{instance.database_name}</strong><small className="table-subline">{instance.server_key} · {shortId(instance.id)}</small></span></div>{result && <small className={`verification-note ${result.ok ? "note-success" : "note-danger"}`}>{result.ok ? `Last check passed${result.durationMs != null ? ` · ${result.durationMs} ms` : ""}` : result.code || "Last check failed"}</small>}</td><td>{project ? <span className="project-name-cell">{project.name}</span> : <code className="id-code">{shortId(instance.project_id)}</code>}</td><td><Status value={instance.environment} /></td><td><Status value={instance.status} /></td><td className="muted-cell">{formatDate(instance.created_at)}</td><td><div className="row-actions">{instance.status === "retired" ? <span className="muted-cell">Retired</span> : <><button className="button button-small button-secondary" disabled={isBusy || isProvisioning || !!busyId || !!provisioningId} onClick={() => void onVerify(instance)}>{isBusy ? <><span className="button-spinner" />Checking…</> : <><Icon name="refresh" />Verify</>}</button>{instance.environment === "development" && instance.status !== "ready" && <button className="button button-small button-primary" disabled={isBusy || isProvisioning || !!busyId || !!provisioningId || instance.status === "provisioning"} onClick={() => void onProvision(instance)}>{isProvisioning ? <><span className="button-spinner" />Provisioning…</> : <><Icon name="database" />Provision</>}</button>}</>}</div></td></tr>;
-  })}</tbody></table></div>;
-}
 export default App;

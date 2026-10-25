@@ -23,12 +23,12 @@ export interface AuditEvent {
 
 export function createAuditEventRepository(executor: SqlExecutor) {
   return {
-    async create(input: CreateAuditEventInput): Promise<AuditEvent> {
-      const result = await executor.query<AuditEvent>(
+    async create(input: CreateAuditEventInput): Promise<{ id: string }> {
+      const result = await executor.query<{ id: string }>(
         `INSERT INTO public.audit_events
           (id, actor, action, target, outcome, details)
          VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING id, actor, action, target, outcome, details, created_at`,
+         RETURNING id`,
         [
           randomUUID(),
           input.actor,
