@@ -15,6 +15,10 @@ const testCsrfToken = "test-csrf-token-for-app-tests";
 const testViewerUserId = "12a0f0e1-6734-4d87-97fd-4ecb1a000004";
 const testViewerSessionToken = "test-viewer-session-token-for-app-tests";
 const testViewerCsrfToken = "test-viewer-csrf-token-for-app-tests";
+const testSuperAdminUserId = "12a0f0e1-6734-4d87-97fd-4ecb1a000005";
+const testSuperAdminSessionToken = "test-super-admin-session-token-for-app-tests";
+const testSuperAdminCsrfToken = "test-super-admin-csrf-token-for-app-tests";
+const secondTenantId = "32a0f0e1-6734-4d87-97fd-4ecb1a000001";
 const crossTenantId = "22a0f0e1-6734-4d87-97fd-4ecb1a000001";
 const crossTenantProjectId = "22a0f0e1-6734-4d87-97fd-4ecb1a000010";
 const crossTenantInstanceId = "22a0f0e1-6734-4d87-97fd-4ecb1a000011";
@@ -131,22 +135,37 @@ function createTestPool(options: {
 
       if (statement.includes("FROM public.auth_sessions AS s") &&
           statement.includes("JOIN public.users AS u")) {
+        const isSuperAdmin =
+          values[0] === hashToken(testSuperAdminSessionToken);
         const isViewer = values[0] === hashToken(testViewerSessionToken);
-        const valid = isViewer || values[0] === hashToken(testSessionToken);
+        const valid =
+          isSuperAdmin ||
+          isViewer ||
+          values[0] === hashToken(testSessionToken);
         const row = valid
           ? {
               id: "12a0f0e1-6734-4d87-97fd-4ecb1a000003",
-              user_id: isViewer ? testViewerUserId : testUserId,
+              user_id: isSuperAdmin
+                ? testSuperAdminUserId
+                : isViewer
+                  ? testViewerUserId
+                  : testUserId,
               csrf_token_hash: hashToken(
-                isViewer ? testViewerCsrfToken : testCsrfToken,
+                isSuperAdmin
+                  ? testSuperAdminCsrfToken
+                  : isViewer
+                    ? testViewerCsrfToken
+                    : testCsrfToken,
               ),
               expires_at: new Date(Date.now() + 60 * 60 * 1000),
               user_agent: null,
               client_ip: null,
-              email: isViewer
-                ? "viewer@example.test"
-                : "tenant-admin@example.test",
-              is_super_admin: false,
+              email: isSuperAdmin
+                ? "super-admin@example.test"
+                : isViewer
+                  ? "viewer@example.test"
+                  : "tenant-admin@example.test",
+              is_super_admin: isSuperAdmin,
               user_status: "active",
             }
           : null;
@@ -165,6 +184,28 @@ function createTestPool(options: {
               role: isViewer ? "viewer" : "admin",
             }]
           : [];
+        return { rows, rowCount: rows.length };
+      }
+
+      if (
+        statement.includes("FROM public.tenants") &&
+        statement.includes("WHERE status = 'active'") &&
+        statement.includes("ORDER BY name, id")
+      ) {
+        const rows = [
+          {
+            id: secondTenantId,
+            tenant_key: "second-tenant",
+            name: "Second Tenant",
+            status: "active",
+          },
+          {
+            id: testTenantId,
+            tenant_key: "test-tenant",
+            name: "Test Tenant",
+            status: "active",
+          },
+        ];
         return { rows, rowCount: rows.length };
       }
 
@@ -1244,6 +1285,58 @@ test("protected API rejects requests without a session", async () => {
     const response = await app.inject({
       method: "GET",
       url: "/api/projects",
+    });
+
+    assert.equal(response.statusCode, 401);
+  } finally {
+    await app.close();
+  }
+});
+
+test("Super Admin can list active tenants without a tenant header or membership", async () => {
+  const { app } = setup();
+
+  try {
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/tenants",
+      headers: {
+        cookie: `ppm_session=${testSuperAdminSessionToken}; ppm_csrf=${testSuperAdminCsrfToken}`,
+      },
+    });
+
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(
+      response.json().data.map((tenant: { id: string }) => tenant.id),
+      [secondTenantId, testTenantId],
+    );
+  } finally {
+    await app.close();
+  }
+});
+
+test("ordinary authenticated user cannot list tenants", async () => {
+  const { app } = setup();
+
+  try {
+    const response = await testInjectAsTenantAdmin(app, {
+      method: "GET",
+      url: "/api/tenants",
+    });
+
+    assert.equal(response.statusCode, 403);
+  } finally {
+    await app.close();
+  }
+});
+
+test("tenant list endpoint requires authentication", async () => {
+  const { app } = setup();
+
+  try {
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/tenants",
     });
 
     assert.equal(response.statusCode, 401);

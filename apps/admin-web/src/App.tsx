@@ -19,6 +19,62 @@ type Session = {
   memberships: Membership[];
 };
 
+type Tenant = {
+  id: string;
+  tenant_key: string;
+  name: string;
+  status: "active";
+};
+
+async function getInitialWorkspace(profile: Session): Promise<{
+  tenants: Tenant[];
+  tenantId: string;
+}> {
+  if (!profile.is_super_admin) {
+    return {
+      tenants: [],
+      tenantId: profile.memberships[0]?.tenant_id ?? "",
+    };
+  }
+
+  const response = await fetch("/api/tenants", {
+    credentials: "include",
+  });
+
+  if (!response.ok) {
+    throw new Error(await readApiError(response));
+  }
+
+  const body = await response.json() as { data: Tenant[] };
+  return {
+    tenants: body.data,
+    tenantId: body.data[0]?.id ?? "",
+  };
+}
+
+type ApiProject = {
+  id: string;
+  tenant_id: string;
+  project_key: string;
+  name: string;
+  status: "active" | "inactive" | "archived";
+  created_at: string;
+};
+
+type ApiDatabaseInstance = {
+  id: string;
+  project_id: string;
+  environment: "development" | "staging" | "production";
+  database_name: string;
+  server_key: string;
+  status: "planned" | "provisioning" | "ready" | "failed" | "retired";
+  created_at: string;
+};
+
+type ApiList<T> = {
+  data: T[];
+};
+
 type AuthStatus = "loading" | "authenticated" | "unauthenticated" | "error";
 
 function readCsrfCookie(): string | null {
@@ -46,48 +102,6 @@ async function readApiError(response: Response): Promise<string> {
   return `Request failed (${response.status}).`;
 }
 
-
-type Project = {
-  name: string;
-  key: string;
-  environment: string;
-  database: string;
-  status: "Healthy" | "Warning" | "Offline";
-  updated: string;
-};
-
-const projects: Project[] = [
-  {
-    name: "Ogwusearch Engineering",
-    key: "OGW",
-    environment: "Production",
-    database: "ogwusearch_prod",
-    status: "Healthy",
-    updated: "2 minutes ago",
-  },
-  {
-    name: "SolarAudit",
-    key: "SOL",
-    environment: "Development",
-    database: "solar_audit_dev",
-    status: "Healthy",
-    updated: "18 minutes ago",
-  },
-  {
-    name: "Resort Platform",
-    key: "RST",
-    environment: "Production",
-    database: "resort_platform_prod",
-    status: "Warning",
-    updated: "34 minutes ago",
-  },
-];
-
-const instances = [
-  { name: "ogwusearch_prod", project: "Ogwusearch Engineering", env: "Production", status: "Connected", version: "PostgreSQL 16" },
-  { name: "solar_audit_dev", project: "SolarAudit", env: "Development", status: "Connected", version: "PostgreSQL 16" },
-  { name: "resort_platform_prod", project: "Resort Platform", env: "Production", status: "Attention", version: "PostgreSQL 15" },
-];
 
 const navigation = [
   { section: "WORKSPACE", items: [
@@ -150,18 +164,32 @@ function Icon({ name, size = 18 }: { name: string; size?: number }) {
 }
 
 function Status({ value }: { value: string }) {
-  const kind = value === "Healthy" || value === "Connected"
-    ? "success"
-    : value === "Warning" || value === "Attention"
-      ? "warning"
-      : "neutral";
+  const kind =
+    value === "active" || value === "ready"
+      ? "success"
+      : value === "failed" || value === "archived" ||
+          value === "provisioning"
+        ? "warning"
+        : "neutral";
 
-  return <span className={`status status-${kind}`}><span className="status-dot" />{value}</span>;
+  const label = value.replaceAll("_", " ");
+
+  return (
+    <span className={`status status-${kind}`}>
+      <span className="status-dot" />
+      {label.charAt(0).toUpperCase() + label.slice(1)}
+    </span>
+  );
+}
+
+function projectsNameForSearch(projectId: string, projects: ApiProject[]): string {
+  return projects.find((project) => project.id === projectId)?.name ?? "";
 }
 
 function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus>("loading");
   const [session, setSession] = useState<Session | null>(null);
+  const [availableTenants, setAvailableTenants] = useState<Tenant[]>([]);
   const [selectedTenantId, setSelectedTenantId] = useState("");
   const [authError, setAuthError] = useState("");
   const [loginEmail, setLoginEmail] = useState("");
@@ -171,6 +199,11 @@ function App() {
   const [activePage, setActivePage] = useState("Overview");
   const [search, setSearch] = useState("");
   const [environment, setEnvironment] = useState("All environments");
+
+  const [apiProjects, setApiProjects] = useState<ApiProject[]>([]);
+  const [apiInstances, setApiInstances] = useState<ApiDatabaseInstance[]>([]);
+  const [dataLoading, setDataLoading] = useState(false);
+  const [dataError, setDataError] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -191,10 +224,12 @@ function App() {
         }
 
         const body = await response.json() as { data: Session };
+        const workspace = await getInitialWorkspace(body.data);
         if (cancelled) return;
 
         setSession(body.data);
-        setSelectedTenantId(body.data.memberships[0]?.tenant_id ?? "");
+        setAvailableTenants(workspace.tenants);
+        setSelectedTenantId(workspace.tenantId);
         setAuthError("");
         setAuthStatus("authenticated");
       } catch {
@@ -209,6 +244,88 @@ function App() {
     return () => { cancelled = true; };
   }, []);
 
+  useEffect(() => {
+    if (authStatus !== "authenticated" || !selectedTenantId) {
+      setApiProjects([]);
+      setApiInstances([]);
+      setDataError("");
+      setDataLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+
+    async function loadWorkspaceData() {
+      setDataLoading(true);
+      setDataError("");
+      setApiProjects([]);
+      setApiInstances([]);
+
+      try {
+        const headers = { "X-Tenant-Id": selectedTenantId };
+
+        const [projectsResponse, instancesResponse] = await Promise.all([
+          fetch("/api/projects?limit=100&offset=0", {
+            credentials: "include",
+            headers,
+          }),
+          fetch("/api/database-instances", {
+            credentials: "include",
+            headers,
+          }),
+        ]);
+
+        if (!projectsResponse.ok) {
+          throw new Error(await readApiError(projectsResponse));
+        }
+
+        if (!instancesResponse.ok) {
+          throw new Error(await readApiError(instancesResponse));
+        }
+
+        const projectsBody = await projectsResponse.json() as ApiList<ApiProject>;
+        const instancesBody = await instancesResponse.json() as ApiList<ApiDatabaseInstance>;
+
+        if (!cancelled) {
+          setApiProjects(projectsBody.data);
+          setApiInstances(instancesBody.data);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setDataError(
+            error instanceof Error
+              ? error.message
+              : "Unable to load workspace data.",
+          );
+        }
+      } finally {
+        if (!cancelled) setDataLoading(false);
+      }
+    }
+
+    void loadWorkspaceData();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authStatus, selectedTenantId]);
+
+  const workspaceOptions = session?.is_super_admin
+    ? availableTenants.map((tenant) => ({
+        tenant_id: tenant.id,
+        tenant_key: tenant.tenant_key,
+        tenant_name: tenant.name,
+      }))
+    : (session?.memberships ?? []).map((membership) => ({
+        tenant_id: membership.tenant_id,
+        tenant_key: membership.tenant_key,
+        tenant_name: membership.tenant_name,
+      }));
+
+  const selectedWorkspace = workspaceOptions.find(
+    (workspace) => workspace.tenant_id === selectedTenantId,
+  );
+
   const selectedMembership = session?.memberships.find(
     (membership) => membership.tenant_id === selectedTenantId,
   );
@@ -217,11 +334,33 @@ function App() {
     ? "super_admin"
     : selectedMembership?.role ?? "viewer";
 
-  const visibleProjects = useMemo(() => projects.filter((project) => {
-    const matchesSearch = `${project.name} ${project.database}`.toLowerCase().includes(search.toLowerCase());
-    const matchesEnvironment = environment === "All environments" || project.environment === environment;
-    return matchesSearch && matchesEnvironment;
-  }), [search, environment]);
+  const visibleProjects = useMemo(
+    () => apiProjects.filter((project) =>
+      `${project.name} ${project.project_key}`
+        .toLowerCase()
+        .includes(search.toLowerCase()),
+    ),
+    [apiProjects, search],
+  );
+
+  const visibleInstances = useMemo(() => {
+    const filtered = apiInstances.filter((instance) => {
+      const matchesSearch = [
+        instance.database_name,
+        instance.server_key,
+        instance.environment,
+        projectsNameForSearch(instance.project_id, apiProjects),
+      ].join(" ").toLowerCase().includes(search.toLowerCase());
+
+      const matchesEnvironment =
+        environment === "All environments" ||
+        instance.environment === environment.toLowerCase();
+
+      return matchesSearch && matchesEnvironment;
+    });
+
+    return filtered;
+  }, [apiInstances, apiProjects, search, environment]);
 
   const canManage = role === "super_admin" || role === "admin";
   const isViewer = role === "viewer";
@@ -259,9 +398,12 @@ function App() {
       }
 
       const body = await profileResponse.json() as { data: Session };
+      const workspace = await getInitialWorkspace(body.data);
       setSession(body.data);
-      setSelectedTenantId(body.data.memberships[0]?.tenant_id ?? "");
+      setAvailableTenants(workspace.tenants);
+      setSelectedTenantId(workspace.tenantId);
       setLoginPassword("");
+      setAuthError("");
       setAuthStatus("authenticated");
     } catch (error) {
       setAuthError(
@@ -293,6 +435,7 @@ function App() {
       }
 
       setSession(null);
+      setAvailableTenants([]);
       setSelectedTenantId("");
       setLoginPassword("");
       setAuthStatus("unauthenticated");
@@ -370,6 +513,8 @@ function App() {
             className="secondary-button"
             onClick={() => {
               setSession(null);
+              setAvailableTenants([]);
+              setSelectedTenantId("");
               setAuthStatus("unauthenticated");
               setAuthError("");
             }}
@@ -381,15 +526,16 @@ function App() {
     );
   }
 
-  if (!selectedTenantId || !selectedMembership) {
+  if (!selectedTenantId || !selectedWorkspace) {
     return (
       <main className="auth-screen">
         <section className="auth-card">
           <span className="brand-mark"><Icon name="shield" size={23} /></span>
           <h1>No workspace available</h1>
           <p className="subtitle">
-            Your account has no available tenant membership. Ask a platform administrator
-            to grant access before opening workspace data.
+            {session.is_super_admin
+              ? "No active tenants are available to manage. Create or activate a tenant before opening workspace data."
+              : "Your account has no available tenant membership. Ask a platform administrator to grant access before opening workspace data."}
           </p>
           {authError && <p className="auth-error" role="alert">{authError}</p>}
           <button className="secondary-button" onClick={() => void handleLogout()}>
@@ -411,18 +557,18 @@ function App() {
         <div className="workspace-switcher">
           <span className="workspace-avatar">P</span>
           <span className="workspace-copy">
-            <strong>{selectedMembership.tenant_name}</strong>
-            <small>{selectedMembership.tenant_key}</small>
+            <strong>{selectedWorkspace.tenant_name}</strong>
+            <small>{selectedWorkspace.tenant_key}</small>
           </span>
-          {session.memberships.length > 1 && (
+          {workspaceOptions.length > 1 && (
             <select
               aria-label="Select workspace"
               value={selectedTenantId}
               onChange={(event) => setSelectedTenantId(event.target.value)}
             >
-              {session.memberships.map((membership) => (
-                <option key={membership.tenant_id} value={membership.tenant_id}>
-                  {membership.tenant_name}
+              {workspaceOptions.map((workspace) => (
+                <option key={workspace.tenant_id} value={workspace.tenant_id}>
+                  {workspace.tenant_name}
                 </option>
               ))}
             </select>
@@ -493,72 +639,132 @@ function App() {
         </header>
 
         <div className="page-content">
-          <div className="demo-banner"><span className="demo-dot" /> DEMO PREVIEW <span>Sample data · Not connected to the API</span></div>
+          <div className="demo-banner">
+            <span className="demo-dot" />
+            API WORKSPACE
+            <span>
+              {dataLoading ? "Loading tenant data…" : "Connected to the authenticated API"}
+            </span>
+          </div>
+          {dataError && (
+            <p className="auth-error" role="alert">
+              Unable to load workspace data: {dataError}
+            </p>
+          )}
 
           {activePage === "Overview" ? (
             <>
               <section className="page-heading">
-                <div><p className="eyebrow">MONDAY, OCTOBER 21</p><h1>Good morning<span>,</span> welcome back.</h1><p className="subtitle">Here's what's happening across your database infrastructure.</p></div>
+                <div><p className="eyebrow">WORKSPACE OVERVIEW</p><h1>Welcome back.</h1><p className="subtitle">Projects and database instances for the selected workspace.</p></div>
                 {canManage && <button className="primary-button" onClick={() => setActivePage("Projects")}><Icon name="plus" size={17} /> New project</button>}
               </section>
 
-              <section className="metric-grid" aria-label="Platform metrics">
+              <section className="metric-grid" aria-label="Workspace metrics">
                 <article className="metric-card">
-                  <div className="metric-top"><span>Total projects</span><span className="metric-icon violet"><Icon name="layers" /></span></div>
-                  <div className="metric-value">12</div><div className="metric-foot"><span className="trend-up">↗ 2</span><span>from last month</span></div>
-                  <div className="metric-sparkline spark-violet"><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /></div>
+                  <div className="metric-top"><span>Projects</span><span className="metric-icon violet"><Icon name="layers" /></span></div>
+                  <div className="metric-value">{dataLoading ? "—" : apiProjects.length}</div>
+                  <div className="metric-foot"><span className="metric-muted">Loaded for this workspace</span></div>
                 </article>
                 <article className="metric-card">
                   <div className="metric-top"><span>Database instances</span><span className="metric-icon blue"><Icon name="database" /></span></div>
-                  <div className="metric-value">28</div><div className="metric-foot"><span className="metric-muted">Across all environments</span></div>
-                  <div className="metric-sparkline spark-blue"><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /></div>
+                  <div className="metric-value">{dataLoading ? "—" : apiInstances.length}</div>
+                  <div className="metric-foot"><span className="metric-muted">Across listed environments</span></div>
                 </article>
                 <article className="metric-card">
-                  <div className="metric-top"><span>Healthy instances</span><span className="metric-icon green"><Icon name="activity" /></span></div>
-                  <div className="metric-value">26<span className="metric-total">/28</span></div><div className="metric-foot"><span className="trend-up">92.8%</span><span>operational</span></div>
-                  <div className="progress-track"><span style={{ width: "92.8%" }} /></div>
+                  <div className="metric-top"><span>Ready instances</span><span className="metric-icon green"><Icon name="activity" /></span></div>
+                  <div className="metric-value">{dataLoading ? "—" : apiInstances.filter((instance) => instance.status === "ready").length}</div>
+                  <div className="metric-foot"><span className="metric-muted">Status reported by API</span></div>
                 </article>
                 <article className="metric-card">
-                  <div className="metric-top"><span>Backups today</span><span className="metric-icon amber"><Icon name="archive" /></span></div>
-                  <div className="metric-value">8</div><div className="metric-foot"><span className="metric-muted">Last backup 14 min ago</span></div>
-                  <div className="backup-bars">{[30, 55, 42, 78, 50, 90, 65, 100, 68, 84, 58, 75].map((height, index) => <i key={index} style={{ height: `${height}%` }} />)}</div>
+                  <div className="metric-top"><span>Needs review</span><span className="metric-icon amber"><Icon name="archive" /></span></div>
+                  <div className="metric-value">{dataLoading ? "—" : apiInstances.filter((instance) => instance.status === "failed" || instance.status === "provisioning").length}</div>
+                  <div className="metric-foot"><span className="metric-muted">Failed or provisioning</span></div>
                 </article>
               </section>
 
               <section className="content-grid">
                 <article className="panel projects-panel">
-                  <div className="panel-heading"><div><h2>Projects</h2><p>Manage your connected project environments</p></div><button className="text-button" onClick={() => setActivePage("Projects")}>View all <Icon name="arrow" size={15} /></button></div>
+                  <div className="panel-heading">
+                    <div><h2>Projects</h2><p>Projects registered in this workspace</p></div>
+                    <button className="text-button" onClick={() => setActivePage("Projects")}>View all <Icon name="arrow" size={15} /></button>
+                  </div>
                   <div className="table-toolbar">
                     <span className="result-count">{visibleProjects.length} projects shown</span>
-                    <select value={environment} onChange={(event) => setEnvironment(event.target.value)} aria-label="Filter by environment">
-                      <option>All environments</option><option>Development</option><option>Production</option>
-                    </select>
                   </div>
-                  <div className="table-scroll"><table><thead><tr><th>PROJECT</th><th>ENVIRONMENT</th><th>STATUS</th><th>LAST ACTIVITY</th><th /></tr></thead><tbody>
-                    {visibleProjects.map((project) => <tr key={project.key}>
-                      <td><div className="project-cell"><span className={`project-avatar avatar-${project.key.toLowerCase()}`}>{project.key.slice(0, 1)}</span><span><strong>{project.name}</strong><small>{project.database}</small></span></div></td>
-                      <td><span className={`environment-pill ${project.environment === "Production" ? "production" : "development"}`}>{project.environment}</span></td>
-                      <td><Status value={project.status} /></td><td className="activity-time">{project.updated}</td>
-                      <td><button className="row-action" aria-label={`Open ${project.name}`} onClick={() => setActivePage("Databases")}><Icon name="chevron" size={16} /></button></td>
-                    </tr>)}
-                    {visibleProjects.length === 0 && <tr><td colSpan={5} className="empty-state">No projects match your search.</td></tr>}
-                  </tbody></table></div>
-                  <div className="panel-footer"><span>Showing sample projects</span><button onClick={() => setActivePage("Projects")}>All projects <Icon name="arrow" size={14} /></button></div>
+                  <div className="table-scroll"><table>
+                    <thead><tr><th>PROJECT</th><th>STATUS</th><th>CREATED</th><th /></tr></thead>
+                    <tbody>
+                      {visibleProjects.map((project) => (
+                        <tr key={project.id}>
+                          <td><div className="project-cell">
+                            <span className="project-avatar">{project.project_key.slice(0, 1).toUpperCase()}</span>
+                            <span><strong>{project.name}</strong><small>{project.project_key}</small></span>
+                          </div></td>
+                          <td><Status value={project.status} /></td>
+                          <td className="activity-time">{new Date(project.created_at).toLocaleDateString()}</td>
+                          <td><button className="row-action" aria-label={`Open ${project.name}`} onClick={() => setActivePage("Databases")}><Icon name="chevron" size={16} /></button></td>
+                        </tr>
+                      ))}
+                      {!dataLoading && visibleProjects.length === 0 && (
+                        <tr><td colSpan={4} className="empty-state">
+                          {search ? "No projects match your search." : "No projects are registered in this workspace yet."}
+                        </td></tr>
+                      )}
+                      {dataLoading && <tr><td colSpan={4} className="empty-state">Loading projects…</td></tr>}
+                    </tbody>
+                  </table></div>
+                  <div className="panel-footer"><span>{dataLoading ? "Loading workspace data" : "Live API results"}</span><button onClick={() => setActivePage("Projects")}>All projects <Icon name="arrow" size={14} /></button></div>
                 </article>
 
                 <article className="panel health-panel">
-                  <div className="panel-heading"><div><h2>Infrastructure health</h2><p>Current instance status</p></div><button className="icon-button subtle" aria-label="More health options"><Icon name="more" /></button></div>
-                  <div className="health-score"><div className="health-ring"><div><strong>93<span>%</span></strong><small>HEALTHY</small></div></div><div className="health-summary"><strong>Everything looks good</strong><p>Most database instances are operating normally.</p><span className="health-updated"><span className="status-dot" /> Updated just now (demo)</span></div></div>
-                  <div className="health-breakdown"><div><span><i className="legend-dot healthy" /> Healthy</span><strong>26</strong></div><div><span><i className="legend-dot warning" /> Needs attention</span><strong>2</strong></div><div><span><i className="legend-dot offline" /> Offline</span><strong>0</strong></div></div>
-                  <button className="health-link" onClick={() => setActivePage("Monitoring")}>View monitoring <Icon name="arrow" size={15} /></button>
+                  <div className="panel-heading"><div><h2>Instance status</h2><p>Current status reported by the API</p></div></div>
+                  <div className="health-breakdown">
+                    <div><span><i className="legend-dot healthy" /> Ready</span><strong>{apiInstances.filter((instance) => instance.status === "ready").length}</strong></div>
+                    <div><span><i className="legend-dot warning" /> Provisioning</span><strong>{apiInstances.filter((instance) => instance.status === "provisioning").length}</strong></div>
+                    <div><span><i className="legend-dot offline" /> Failed</span><strong>{apiInstances.filter((instance) => instance.status === "failed").length}</strong></div>
+                  </div>
+                  <button className="health-link" onClick={() => setActivePage("Databases")}>View instances <Icon name="arrow" size={15} /></button>
                 </article>
               </section>
 
               <section className="panel instances-panel">
-                <div className="panel-heading"><div><h2>Database instances</h2><p>Recently accessed database environments</p></div><button className="text-button" onClick={() => setActivePage("Databases")}>Manage instances <Icon name="arrow" size={15} /></button></div>
-                <div className="table-scroll"><table><thead><tr><th>DATABASE INSTANCE</th><th>PROJECT</th><th>ENVIRONMENT</th><th>ENGINE</th><th>STATUS</th><th /></tr></thead><tbody>
-                  {instances.map((instance) => <tr key={instance.name}><td><div className="database-cell"><span className="database-symbol"><Icon name="database" size={17} /></span><strong>{instance.name}</strong></div></td><td>{instance.project}</td><td>{instance.env}</td><td><span className="engine-label"><span />{instance.version}</span></td><td><Status value={instance.status} /></td><td><button className="row-action" aria-label={`Open ${instance.name}`} onClick={() => setActivePage("Databases")}><Icon name="chevron" size={16} /></button></td></tr>)}
-                </tbody></table></div>
+                <div className="panel-heading">
+                  <div><h2>Database instances</h2><p>Registered database environments</p></div>
+                  <button className="text-button" onClick={() => setActivePage("Databases")}>Manage instances <Icon name="arrow" size={15} /></button>
+                </div>
+                <div className="table-toolbar">
+                  <span className="result-count">{visibleInstances.length} instances shown</span>
+                  <select value={environment} onChange={(event) => setEnvironment(event.target.value)} aria-label="Filter by environment">
+                    <option value="All environments">All environments</option>
+                    <option value="development">Development</option>
+                    <option value="staging">Staging</option>
+                    <option value="production">Production</option>
+                  </select>
+                </div>
+                <div className="table-scroll"><table>
+                  <thead><tr><th>DATABASE INSTANCE</th><th>PROJECT</th><th>ENVIRONMENT</th><th>SERVER</th><th>STATUS</th><th /></tr></thead>
+                  <tbody>
+                    {visibleInstances.map((instance) => {
+                      const project = apiProjects.find((item) => item.id === instance.project_id);
+                      return (
+                        <tr key={instance.id}>
+                          <td><div className="database-cell"><span className="database-symbol"><Icon name="database" size={17} /></span><strong>{instance.database_name}</strong></div></td>
+                          <td>{project?.name ?? "Unknown project"}</td>
+                          <td>{instance.environment}</td>
+                          <td>{instance.server_key}</td>
+                          <td><Status value={instance.status} /></td>
+                          <td><button className="row-action" aria-label={`Open ${instance.database_name}`} onClick={() => setActivePage("Databases")}><Icon name="chevron" size={16} /></button></td>
+                        </tr>
+                      );
+                    })}
+                    {!dataLoading && visibleInstances.length === 0 && (
+                      <tr><td colSpan={6} className="empty-state">
+                        {search || environment !== "All environments" ? "No instances match the selected filters." : "No database instances are registered in this workspace yet."}
+                      </td></tr>
+                    )}
+                    {dataLoading && <tr><td colSpan={6} className="empty-state">Loading database instances…</td></tr>}
+                  </tbody>
+                </table></div>
               </section>
               <footer className="page-footer"><span>pgcontrol <span>·</span> Database management platform</span><span><i className="status-dot" /> Signed in as {session.email}</span></footer>
             </>

@@ -141,6 +141,17 @@ export function createAuthRepository(executor: SqlExecutor) {
       return result.rows[0] ?? null;
     },
 
+    async listActiveTenants(): Promise<ActiveTenant[]> {
+      const result = await executor.query<ActiveTenant>(
+        `SELECT id, tenant_key, name, status
+         FROM public.tenants
+         WHERE status = 'active'
+         ORDER BY name, id`,
+      );
+
+      return result.rows;
+    },
+
     async listMemberships(userId: string): Promise<TenantMembership[]> {
       const result = await executor.query<TenantMembership>(
         `SELECT

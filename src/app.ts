@@ -173,7 +173,11 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
         }
       }
 
-      if (pathname === "/api/auth/me" || pathname === "/api/auth/logout") {
+      if (
+        pathname === "/api/auth/me" ||
+        pathname === "/api/auth/logout" ||
+        pathname === "/api/tenants"
+      ) {
         return;
       }
 
@@ -494,6 +498,27 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
     } catch (error) {
       request.log.error({ err: error }, "Failed to retrieve session profile");
       return reply.code(500).send({ error: "Unable to retrieve profile." });
+    }
+  });
+
+  app.get("/api/tenants", async (request, reply) => {
+    const session = requestSessions.get(request);
+
+    if (!session) {
+      return reply.code(401).send({ error: "Authentication required." });
+    }
+
+    if (!session.is_super_admin) {
+      return reply.code(403).send({
+        error: "Super Admin access is required to list tenants.",
+      });
+    }
+
+    try {
+      return { data: await auth.listActiveTenants() };
+    } catch (error) {
+      request.log.error({ err: error }, "Failed to list active tenants");
+      return reply.code(500).send({ error: "Unable to retrieve tenants." });
     }
   });
 
