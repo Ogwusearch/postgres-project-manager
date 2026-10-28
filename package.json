@@ -22,7 +22,9 @@
     "pretest:integration": "pnpm --filter @postgres-project-manager/project-registry build && pnpm --filter @postgres-project-manager/migration-runner build",
     "predev": "pnpm --filter @postgres-project-manager/project-registry build && pnpm --filter @postgres-project-manager/migration-runner build",
     "predb:migrate:control": "pnpm --filter @postgres-project-manager/migration-runner build",
-    "bootstrap:super-admin": "tsx scripts/bootstrap-super-admin.ts"
+    "bootstrap:super-admin": "tsx scripts/bootstrap-super-admin.ts",
+    "predb:migrate:control:production": "pnpm --filter @postgres-project-manager/migration-runner build",
+    "db:migrate:control:production": "node scripts/control-migrations.mjs --allow-protected-control-db"
   },
   "keywords": [],
   "author": "",

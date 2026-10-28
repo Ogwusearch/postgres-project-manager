@@ -5,7 +5,7 @@ import { config } from "dotenv";
 
 import {
   assertContiguousMigrationVersions,
-  assertSafeControlMigrationDatabase,
+  assertControlMigrationTarget,
   assertExpectedConstraintDefinitions,
   assertExpectedIndexDefinitions,
   assertFreshDatabaseHasNoPublicObjects,
@@ -21,7 +21,35 @@ config();
 
 const { Client } = pg;
 const migrationDirectory = resolve("database/control-migrations");
-const baselineRequested = process.argv.includes("--baseline-existing");
+const cliArgs = process.argv.slice(2);
+const baselineRequested = cliArgs.includes("--baseline-existing");
+const allowProtectedTarget = cliArgs.includes("--allow-protected-control-db");
+const confirmationArgs = cliArgs.filter((arg) =>
+  arg.startsWith("--confirm-control-database="),
+);
+const unsupportedArgs = cliArgs.filter((arg) =>
+  arg.startsWith("--") &&
+  arg !== "--baseline-existing" &&
+  arg !== "--allow-protected-control-db" &&
+  !arg.startsWith("--confirm-control-database=")
+);
+
+if (
+  unsupportedArgs.length > 0 ||
+  confirmationArgs.length > 1 ||
+  cliArgs.includes("--confirm-control-database")
+) {
+  throw new Error("Unsupported or duplicate command-line option");
+}
+
+if (baselineRequested && allowProtectedTarget) {
+  throw new Error("Baseline mode cannot be combined with protected control migrations");
+}
+
+const confirmationDatabase = confirmationArgs.length === 1
+  ? confirmationArgs[0].slice("--confirm-control-database=".length)
+  : undefined;
+
 const lockKeys = [73198420, 11235813];
 
 const expectedColumns = {
@@ -405,13 +433,17 @@ async function createHistoryTable(client) {
 }
 
 async function main() {
-  if (process.argv.some((arg) => arg.startsWith("--") && arg !== "--baseline-existing")) {
-    throw new Error("Unsupported command-line option");
-  }
-
   const database = requiredEnv("CONTROL_MIGRATION_DATABASE");
-  assertSafeControlMigrationDatabase(database);
   const user = requiredEnv("CONTROL_MIGRATION_USER");
+
+  assertControlMigrationTarget({
+    database,
+    allowProtected: allowProtectedTarget,
+    confirmation: confirmationDatabase,
+    migrationUser: user,
+    runtimeUser: process.env.PGUSER,
+  });
+
   const password = requiredEnv("CONTROL_MIGRATION_PASSWORD");
   const host = requiredEnv("CONTROL_MIGRATION_HOST");
   const port = Number(process.env.CONTROL_MIGRATION_PORT || "55433");

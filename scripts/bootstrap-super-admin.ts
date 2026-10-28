@@ -41,6 +41,12 @@ async function main(): Promise<void> {
     throw new Error("Bootstrap refused: invalid database name.");
   }
 
+  if (database !== "platform_control_db") {
+    throw new Error(
+      "Bootstrap refused: the first Super Admin may only be created in platform_control_db.",
+    );
+  }
+
   if (["postgres", "template0", "template1"].includes(database)) {
     throw new Error("Bootstrap refused: protected database target.");
   }

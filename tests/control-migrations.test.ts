@@ -4,6 +4,7 @@ import {
   assertExpectedConstraintDefinitions,
   assertExpectedIndexDefinitions,
   assertSafeControlMigrationDatabase,
+  assertControlMigrationTarget,
   assertFreshDatabaseHasNoPublicObjects,
 } from "../scripts/control-migrations-lib.mjs";
 
@@ -29,6 +30,72 @@ test("refuses the protected platform control database", () => {
   assert.throws(
     () => assertSafeControlMigrationDatabase("platform_control_db"),
     /Refusing to run control migrations against the protected database/,
+  );
+});
+
+test("normal migration path continues to refuse the protected control database", () => {
+  assert.throws(
+    () => assertControlMigrationTarget({
+      database: "platform_control_db",
+      migrationUser: "ppm_control_admin",
+      runtimeUser: "ppm_registry_app",
+    }),
+    /Refusing to run control migrations against the protected database/,
+  );
+});
+
+test("protected migration path requires exact target confirmation and a separate role", () => {
+  assert.doesNotThrow(() => assertControlMigrationTarget({
+    database: "platform_control_db",
+    allowProtected: true,
+    confirmation: "platform_control_db",
+    migrationUser: "ppm_control_admin",
+    runtimeUser: "ppm_registry_app",
+  }));
+
+  assert.throws(
+    () => assertControlMigrationTarget({
+      database: "platform_control_db",
+      allowProtected: true,
+      confirmation: "wrong_database",
+      migrationUser: "ppm_control_admin",
+      runtimeUser: "ppm_registry_app",
+    }),
+    /exact confirmation/,
+  );
+
+  assert.throws(
+    () => assertControlMigrationTarget({
+      database: "platform_control_db",
+      allowProtected: true,
+      confirmation: "platform_control_db",
+      migrationUser: "ppm_registry_app",
+      runtimeUser: "ppm_registry_app",
+    }),
+    /separate administrative role/,
+  );
+
+  assert.throws(
+    () => assertControlMigrationTarget({
+      database: "some_other_db",
+      allowProtected: true,
+      confirmation: "some_other_db",
+      migrationUser: "ppm_control_admin",
+      runtimeUser: "ppm_registry_app",
+    }),
+    /exact confirmation/,
+  );
+});
+
+test("confirmation cannot be used without the protected-target option", () => {
+  assert.throws(
+    () => assertControlMigrationTarget({
+      database: "ppm_test_control_runner",
+      confirmation: "ppm_test_control_runner",
+      migrationUser: "ppm_control_admin",
+      runtimeUser: "ppm_registry_app",
+    }),
+    /only accepted with --allow-protected-control-db/,
   );
 });
 
