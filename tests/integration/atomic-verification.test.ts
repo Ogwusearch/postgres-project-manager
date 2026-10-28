@@ -147,6 +147,8 @@ test("PostgreSQL verification status and audit are atomic", async () => {
       ],
     );
 
+    // Exercise the verification query with the restricted application role.
+    await client.query('SET LOCAL ROLE ppm_registry_app');
     // Successful status transition and matching audit record.
     const success = await client.query(verificationSql, [
       successId,
@@ -165,6 +167,7 @@ test("PostgreSQL verification status and audit are atomic", async () => {
       tenantId,
     ]);
 
+    await client.query("RESET ROLE");
     assert.equal(success.rows[0]?.lifecycle_status, "ready");
 
     const successAudit = await client.query(
@@ -193,6 +196,7 @@ test("PostgreSQL verification status and audit are atomic", async () => {
 
     let expectedError: { code?: string } | undefined;
 
+    await client.query("SET LOCAL ROLE ppm_registry_app");
     try {
       await client.query(verificationSql, [
         failureId,
@@ -222,6 +226,7 @@ test("PostgreSQL verification status and audit are atomic", async () => {
 
     // Recover from the expected SQL error and inspect the unchanged status.
     await client.query("ROLLBACK TO SAVEPOINT before_expected_failure");
+    await client.query("RESET ROLE");
 
     const unchanged = await client.query(
       `SELECT status

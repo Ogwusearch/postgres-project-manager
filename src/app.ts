@@ -423,8 +423,11 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
         .send({ error: "Too many login attempts. Please try again later." });
     }
 
+    let loginStage = "user_lookup";
+
     try {
       const user = await auth.findUserByEmail(email);
+      loginStage = "password_verification";
       const passwordValid = user
         ? await verifyPassword(password, user.password_hash)
         : false;
@@ -439,6 +442,7 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
 
       loginThrottle.succeeded(email);
 
+      loginStage = "token_generation";
       const sessionToken = createToken();
       const csrfToken = createToken();
       const expiresAt = new Date(
@@ -447,6 +451,7 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
 
       const userAgent = request.headers["user-agent"];
 
+      loginStage = "session_insert";
       await auth.createSession({
         id: randomUUID(),
         user_id: user.id,
@@ -472,7 +477,23 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
           },
         });
     } catch (error) {
-      request.log.error({ err: error }, "Login failed");
+      const diagnostic = error && typeof error === "object"
+        ? error as {
+            name?: unknown;
+            code?: unknown;
+            constraint?: unknown;
+            table?: unknown;
+            column?: unknown;
+          }
+        : {};
+      console.error("[auth.login] failed", {
+        stage: loginStage,
+        name: typeof diagnostic.name === "string" ? diagnostic.name : "UnknownError",
+        code: typeof diagnostic.code === "string" ? diagnostic.code : undefined,
+        constraint: typeof diagnostic.constraint === "string" ? diagnostic.constraint : undefined,
+        table: typeof diagnostic.table === "string" ? diagnostic.table : undefined,
+        column: typeof diagnostic.column === "string" ? diagnostic.column : undefined,
+      });
       return reply.code(500).send({ error: "Unable to sign in." });
     }
   });

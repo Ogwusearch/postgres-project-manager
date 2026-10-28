@@ -132,9 +132,10 @@ test(
       second = await pool.connect();
       monitor = await pool.connect();
 
+      // Keep the audit observer on the same isolated server as the runtime pool.
       auditMonitorPool = new Pool({
-        host: process.env.CONTROL_MIGRATION_HOST ?? "127.0.0.1",
-        port: Number(process.env.CONTROL_MIGRATION_PORT ?? 55433),
+        host: process.env.PGHOST ?? "127.0.0.1",
+        port: Number(process.env.PGPORT ?? 55432),
         user: process.env.CONTROL_MIGRATION_USER,
         password: process.env.CONTROL_MIGRATION_PASSWORD,
         database: databaseName,

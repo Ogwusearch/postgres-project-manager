@@ -1,32 +1,19 @@
 
 import { useEffect, useMemo, useState } from "react";
+import type { ApiDatabaseInstance, ApiProject, AuthStatus, Role, Session, Tenant } from "./app/app-types";
+import AuthScreen from "./features/auth/components/AuthScreen";
+import { revokeLoginSessionBestEffort } from "./app/revoke-login-session";
 import "./App.css";
 import { isWorkspaceDataCurrent } from "./tenant-visibility";
 import { loadWorkspaceData } from "./workspace-data-loader";
 
-type Role = "super_admin" | "admin" | "database_operator" | "viewer";
 
-type Membership = {
-  tenant_id: string;
-  tenant_key: string;
-  tenant_name: string;
-  tenant_status: "active" | "suspended";
-  role: "admin" | "database_operator" | "viewer";
-};
 
-type Session = {
-  id: string;
-  email: string;
-  is_super_admin: boolean;
-  memberships: Membership[];
-};
 
-type Tenant = {
-  id: string;
-  tenant_key: string;
-  name: string;
-  status: "active";
-};
+
+
+
+
 
 async function getInitialWorkspace(profile: Session): Promise<{
   tenants: Tenant[];
@@ -54,26 +41,11 @@ async function getInitialWorkspace(profile: Session): Promise<{
   };
 }
 
-type ApiProject = {
-  id: string;
-  tenant_id: string;
-  project_key: string;
-  name: string;
-  status: "active" | "inactive" | "archived";
-  created_at: string;
-};
 
-type ApiDatabaseInstance = {
-  id: string;
-  project_id: string;
-  environment: "development" | "staging" | "production";
-  database_name: string;
-  server_key: string;
-  status: "planned" | "provisioning" | "ready" | "failed" | "retired";
-  created_at: string;
-};
 
-type AuthStatus = "loading" | "authenticated" | "unauthenticated" | "error";
+
+
+
 
 function readCsrfCookie(): string | null {
   const cookie = document.cookie
@@ -186,6 +158,8 @@ function projectsNameForSearch(projectId: string, projects: ApiProject[]): strin
 
 function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus>("loading");
+  const [authNotice, setAuthNotice] = useState("");
+
   const [session, setSession] = useState<Session | null>(null);
   const [availableTenants, setAvailableTenants] = useState<Tenant[]>([]);
   const [selectedTenantId, setSelectedTenantId] = useState("");
@@ -380,8 +354,12 @@ function App() {
 
   async function handleLogin(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+
+    let loginSessionCreated = false;
+
     setLoginBusy(true);
     setAuthError("");
+    setAuthNotice("");
 
     try {
       const response = await fetch("/api/auth/login", {
@@ -397,6 +375,10 @@ function App() {
       if (!response.ok) {
         throw new Error(await readApiError(response));
       }
+
+      // The server has created a session. Revoke it if subsequent
+      // session verification or initial workspace loading fails.
+      loginSessionCreated = true;
 
       const profileResponse = await fetch("/api/auth/me", {
         credentials: "include",
@@ -424,6 +406,10 @@ function App() {
       setAuthError("");
       setAuthStatus("authenticated");
     } catch (error) {
+      if (loginSessionCreated) {
+        await revokeLoginSessionBestEffort(readCsrfCookie());
+      }
+
       setSession(null);
       setAvailableTenants([]);
       setSelectedTenantId("");
@@ -491,48 +477,18 @@ function App() {
 
   if (authStatus !== "authenticated") {
     return (
-      <main className="auth-screen">
-        <form className="auth-card" onSubmit={handleLogin}>
-          <span className="brand-mark"><Icon name="database" size={23} /></span>
-          <p className="eyebrow">DATABASE PLATFORM</p>
-          <h1>Sign in to pgcontrol</h1>
-          <p className="subtitle">Use your platform account to continue.</p>
-
-          {authError && <p className="auth-error" role="alert">{authError}</p>}
-
-          <label className="auth-field">
-            Email
-            <input
-              id="login-email"
-              name="email"
-              type="email"
-              autoComplete="username"
-              required
-              maxLength={254}
-              value={loginEmail}
-              onChange={(event) => setLoginEmail(event.target.value)}
-            />
-          </label>
-
-          <label className="auth-field">
-            Password
-            <input
-              id="login-password"
-              name="password"
-              type="password"
-              autoComplete="current-password"
-              required
-              maxLength={1024}
-              value={loginPassword}
-              onChange={(event) => setLoginPassword(event.target.value)}
-            />
-          </label>
-
-          <button className="primary-button auth-submit" type="submit" disabled={loginBusy}>
-            {loginBusy ? "Signing in…" : "Sign in"}
-          </button>
-        </form>
-      </main>
+      <AuthScreen
+        authNotice={authNotice}
+        setAuthNotice={setAuthNotice}
+        authError={authError}
+        setAuthError={setAuthError}
+        loginEmail={loginEmail}
+        setLoginEmail={setLoginEmail}
+        loginPassword={loginPassword}
+        setLoginPassword={setLoginPassword}
+        loginBusy={loginBusy}
+        handleLogin={handleLogin}
+      />
     );
   }
 
