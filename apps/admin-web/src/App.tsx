@@ -1,6 +1,8 @@
 
 import { useEffect, useMemo, useState } from "react";
 import "./App.css";
+import { isWorkspaceDataCurrent } from "./tenant-visibility";
+import { loadWorkspaceData } from "./workspace-data-loader";
 
 type Role = "super_admin" | "admin" | "database_operator" | "viewer";
 
@@ -69,10 +71,6 @@ type ApiDatabaseInstance = {
   server_key: string;
   status: "planned" | "provisioning" | "ready" | "failed" | "retired";
   created_at: string;
-};
-
-type ApiList<T> = {
-  data: T[];
 };
 
 type AuthStatus = "loading" | "authenticated" | "unauthenticated" | "error";
@@ -204,6 +202,23 @@ function App() {
   const [apiInstances, setApiInstances] = useState<ApiDatabaseInstance[]>([]);
   const [dataLoading, setDataLoading] = useState(false);
   const [dataError, setDataError] = useState("");
+  const [workspaceDataTenantId, setWorkspaceDataTenantId] = useState("");
+
+  // Never expose records loaded for a different tenant.
+  const workspaceDataIsCurrent = isWorkspaceDataCurrent(
+    authStatus,
+    selectedTenantId,
+    workspaceDataTenantId,
+  );
+
+  const currentApiProjects = useMemo(
+    () => workspaceDataIsCurrent ? apiProjects : [],
+    [workspaceDataIsCurrent, apiProjects],
+  );
+  const currentApiInstances = useMemo(
+    () => workspaceDataIsCurrent ? apiInstances : [],
+    [workspaceDataIsCurrent, apiInstances],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -215,7 +230,18 @@ function App() {
         });
 
         if (response.status === 401) {
-          if (!cancelled) setAuthStatus("unauthenticated");
+          if (!cancelled) {
+            setSession(null);
+            setAvailableTenants([]);
+            setSelectedTenantId("");
+            setWorkspaceDataTenantId("");
+            setApiProjects([]);
+            setApiInstances([]);
+            setDataError("");
+            setDataLoading(false);
+            setAuthError("");
+            setAuthStatus("unauthenticated");
+          }
           return;
         }
 
@@ -229,11 +255,24 @@ function App() {
 
         setSession(body.data);
         setAvailableTenants(workspace.tenants);
+        setWorkspaceDataTenantId("");
+        setApiProjects([]);
+        setApiInstances([]);
+        setDataError("");
+        setDataLoading(Boolean(workspace.tenantId));
         setSelectedTenantId(workspace.tenantId);
         setAuthError("");
         setAuthStatus("authenticated");
       } catch {
         if (!cancelled) {
+          setSession(null);
+          setAvailableTenants([]);
+          setSelectedTenantId("");
+          setWorkspaceDataTenantId("");
+          setApiProjects([]);
+          setApiInstances([]);
+          setDataError("");
+          setDataLoading(false);
           setAuthError("Unable to verify your session. Please try signing in again.");
           setAuthStatus("error");
         }
@@ -245,65 +284,39 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (authStatus !== "authenticated" || !selectedTenantId) {
-      setApiProjects([]);
-      setApiInstances([]);
-      setDataError("");
-      setDataLoading(false);
-      return;
-    }
-
     let cancelled = false;
 
-    async function loadWorkspaceData() {
-      setDataLoading(true);
-      setDataError("");
-      setApiProjects([]);
-      setApiInstances([]);
+    if (authStatus !== "authenticated" || !selectedTenantId) {
+      return () => {
+        cancelled = true;
+      };
+    }
 
-      try {
-        const headers = { "X-Tenant-Id": selectedTenantId };
-
-        const [projectsResponse, instancesResponse] = await Promise.all([
-          fetch("/api/projects?limit=100&offset=0", {
-            credentials: "include",
-            headers,
-          }),
-          fetch("/api/database-instances", {
-            credentials: "include",
-            headers,
-          }),
-        ]);
-
-        if (!projectsResponse.ok) {
-          throw new Error(await readApiError(projectsResponse));
-        }
-
-        if (!instancesResponse.ok) {
-          throw new Error(await readApiError(instancesResponse));
-        }
-
-        const projectsBody = await projectsResponse.json() as ApiList<ApiProject>;
-        const instancesBody = await instancesResponse.json() as ApiList<ApiDatabaseInstance>;
-
-        if (!cancelled) {
-          setApiProjects(projectsBody.data);
-          setApiInstances(instancesBody.data);
-        }
-      } catch (error) {
-        if (!cancelled) {
+    void loadWorkspaceData<ApiProject, ApiDatabaseInstance>(
+      selectedTenantId,
+      {
+        fetcher: fetch,
+        isCancelled: () => cancelled,
+        readError: readApiError,
+        onSuccess: (projects, instances) => {
+          setApiProjects(projects);
+          setApiInstances(instances);
+          setWorkspaceDataTenantId(selectedTenantId);
+          setDataError("");
+        },
+        onError: (error) => {
+          setWorkspaceDataTenantId("");
+          setApiProjects([]);
+          setApiInstances([]);
           setDataError(
             error instanceof Error
               ? error.message
               : "Unable to load workspace data.",
           );
-        }
-      } finally {
-        if (!cancelled) setDataLoading(false);
-      }
-    }
-
-    void loadWorkspaceData();
+        },
+        onSettled: () => setDataLoading(false),
+      },
+    );
 
     return () => {
       cancelled = true;
@@ -335,21 +348,21 @@ function App() {
     : selectedMembership?.role ?? "viewer";
 
   const visibleProjects = useMemo(
-    () => apiProjects.filter((project) =>
+    () => currentApiProjects.filter((project) =>
       `${project.name} ${project.project_key}`
         .toLowerCase()
         .includes(search.toLowerCase()),
     ),
-    [apiProjects, search],
+    [currentApiProjects, search],
   );
 
   const visibleInstances = useMemo(() => {
-    const filtered = apiInstances.filter((instance) => {
+    const filtered = currentApiInstances.filter((instance) => {
       const matchesSearch = [
         instance.database_name,
         instance.server_key,
         instance.environment,
-        projectsNameForSearch(instance.project_id, apiProjects),
+        projectsNameForSearch(instance.project_id, currentApiProjects),
       ].join(" ").toLowerCase().includes(search.toLowerCase());
 
       const matchesEnvironment =
@@ -360,7 +373,7 @@ function App() {
     });
 
     return filtered;
-  }, [apiInstances, apiProjects, search, environment]);
+  }, [currentApiInstances, currentApiProjects, search, environment]);
 
   const canManage = role === "super_admin" || role === "admin";
   const isViewer = role === "viewer";
@@ -401,11 +414,24 @@ function App() {
       const workspace = await getInitialWorkspace(body.data);
       setSession(body.data);
       setAvailableTenants(workspace.tenants);
+      setWorkspaceDataTenantId("");
+      setApiProjects([]);
+      setApiInstances([]);
+      setDataError("");
+      setDataLoading(Boolean(workspace.tenantId));
       setSelectedTenantId(workspace.tenantId);
       setLoginPassword("");
       setAuthError("");
       setAuthStatus("authenticated");
     } catch (error) {
+      setSession(null);
+      setAvailableTenants([]);
+      setSelectedTenantId("");
+      setWorkspaceDataTenantId("");
+      setApiProjects([]);
+      setApiInstances([]);
+      setDataError("");
+      setDataLoading(false);
       setAuthError(
         error instanceof Error ? error.message : "Unable to sign in.",
       );
@@ -437,6 +463,11 @@ function App() {
       setSession(null);
       setAvailableTenants([]);
       setSelectedTenantId("");
+      setWorkspaceDataTenantId("");
+      setApiProjects([]);
+      setApiInstances([]);
+      setDataError("");
+      setDataLoading(false);
       setLoginPassword("");
       setAuthStatus("unauthenticated");
     } catch (error) {
@@ -472,6 +503,8 @@ function App() {
           <label className="auth-field">
             Email
             <input
+              id="login-email"
+              name="email"
               type="email"
               autoComplete="username"
               required
@@ -484,6 +517,8 @@ function App() {
           <label className="auth-field">
             Password
             <input
+              id="login-password"
+              name="password"
               type="password"
               autoComplete="current-password"
               required
@@ -515,6 +550,11 @@ function App() {
               setSession(null);
               setAvailableTenants([]);
               setSelectedTenantId("");
+              setWorkspaceDataTenantId("");
+              setApiProjects([]);
+              setApiInstances([]);
+              setDataError("");
+              setDataLoading(false);
               setAuthStatus("unauthenticated");
               setAuthError("");
             }}
@@ -564,7 +604,18 @@ function App() {
             <select
               aria-label="Select workspace"
               value={selectedTenantId}
-              onChange={(event) => setSelectedTenantId(event.target.value)}
+              onChange={(event) => {
+                const nextTenantId = event.target.value;
+
+                // Invalidate the previous tenant immediately, including
+                // when the user switches back before a request completes.
+                setWorkspaceDataTenantId("");
+                setApiProjects([]);
+                setApiInstances([]);
+                setDataError("");
+                setDataLoading(Boolean(nextTenantId));
+                setSelectedTenantId(nextTenantId);
+              }}
             >
               {workspaceOptions.map((workspace) => (
                 <option key={workspace.tenant_id} value={workspace.tenant_id}>
@@ -662,22 +713,22 @@ function App() {
               <section className="metric-grid" aria-label="Workspace metrics">
                 <article className="metric-card">
                   <div className="metric-top"><span>Projects</span><span className="metric-icon violet"><Icon name="layers" /></span></div>
-                  <div className="metric-value">{dataLoading ? "—" : apiProjects.length}</div>
+                  <div className="metric-value">{dataLoading ? "—" : currentApiProjects.length}</div>
                   <div className="metric-foot"><span className="metric-muted">Loaded for this workspace</span></div>
                 </article>
                 <article className="metric-card">
                   <div className="metric-top"><span>Database instances</span><span className="metric-icon blue"><Icon name="database" /></span></div>
-                  <div className="metric-value">{dataLoading ? "—" : apiInstances.length}</div>
+                  <div className="metric-value">{dataLoading ? "—" : currentApiInstances.length}</div>
                   <div className="metric-foot"><span className="metric-muted">Across listed environments</span></div>
                 </article>
                 <article className="metric-card">
                   <div className="metric-top"><span>Ready instances</span><span className="metric-icon green"><Icon name="activity" /></span></div>
-                  <div className="metric-value">{dataLoading ? "—" : apiInstances.filter((instance) => instance.status === "ready").length}</div>
+                  <div className="metric-value">{dataLoading ? "—" : currentApiInstances.filter((instance) => instance.status === "ready").length}</div>
                   <div className="metric-foot"><span className="metric-muted">Status reported by API</span></div>
                 </article>
                 <article className="metric-card">
                   <div className="metric-top"><span>Needs review</span><span className="metric-icon amber"><Icon name="archive" /></span></div>
-                  <div className="metric-value">{dataLoading ? "—" : apiInstances.filter((instance) => instance.status === "failed" || instance.status === "provisioning").length}</div>
+                  <div className="metric-value">{dataLoading ? "—" : currentApiInstances.filter((instance) => instance.status === "failed" || instance.status === "provisioning").length}</div>
                   <div className="metric-foot"><span className="metric-muted">Failed or provisioning</span></div>
                 </article>
               </section>
@@ -719,9 +770,9 @@ function App() {
                 <article className="panel health-panel">
                   <div className="panel-heading"><div><h2>Instance status</h2><p>Current status reported by the API</p></div></div>
                   <div className="health-breakdown">
-                    <div><span><i className="legend-dot healthy" /> Ready</span><strong>{apiInstances.filter((instance) => instance.status === "ready").length}</strong></div>
-                    <div><span><i className="legend-dot warning" /> Provisioning</span><strong>{apiInstances.filter((instance) => instance.status === "provisioning").length}</strong></div>
-                    <div><span><i className="legend-dot offline" /> Failed</span><strong>{apiInstances.filter((instance) => instance.status === "failed").length}</strong></div>
+                    <div><span><i className="legend-dot healthy" /> Ready</span><strong>{currentApiInstances.filter((instance) => instance.status === "ready").length}</strong></div>
+                    <div><span><i className="legend-dot warning" /> Provisioning</span><strong>{currentApiInstances.filter((instance) => instance.status === "provisioning").length}</strong></div>
+                    <div><span><i className="legend-dot offline" /> Failed</span><strong>{currentApiInstances.filter((instance) => instance.status === "failed").length}</strong></div>
                   </div>
                   <button className="health-link" onClick={() => setActivePage("Databases")}>View instances <Icon name="arrow" size={15} /></button>
                 </article>
@@ -745,7 +796,7 @@ function App() {
                   <thead><tr><th>DATABASE INSTANCE</th><th>PROJECT</th><th>ENVIRONMENT</th><th>SERVER</th><th>STATUS</th><th /></tr></thead>
                   <tbody>
                     {visibleInstances.map((instance) => {
-                      const project = apiProjects.find((item) => item.id === instance.project_id);
+                      const project = currentApiProjects.find((item) => item.id === instance.project_id);
                       return (
                         <tr key={instance.id}>
                           <td><div className="database-cell"><span className="database-symbol"><Icon name="database" size={17} /></span><strong>{instance.database_name}</strong></div></td>
