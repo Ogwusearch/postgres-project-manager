@@ -49,7 +49,10 @@ const verificationSql = `
     FROM current_instance AS ci
     WHERE di.id = ci.id
       AND di.status = ci.status
-      AND ci.status IN ('planned', 'provisioning')
+      AND (
+              ci.status IN ('planned', 'provisioning')
+              OR (ci.status = 'failed' AND $2::boolean)
+            )
     RETURNING
       di.id,
       ci.status AS status_before,

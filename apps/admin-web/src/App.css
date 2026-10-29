@@ -681,3 +681,178 @@ tbody tr:hover { background: #fcfcff; }
     align-items: center;
   }
 }
+
+/* Database Explorer */
+.database-explorer-page { display: flex; flex-direction: column; gap: 18px; }
+.database-explorer-page .page-heading { margin-bottom: 0; }
+.database-explorer-page .instances-panel { margin-bottom: 0; }
+.explorer-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.explorer-action-button { margin-top: 0; padding: 8px 10px; font-size: 10px; white-space: nowrap; }
+.explorer-secondary { display: block; margin-top: 4px; color: #8e95a6; font-size: 10px; }
+.explorer-notice { margin: 0; padding: 12px 14px; border: 1px solid #ccebdc; border-radius: 8px; background: #f2fbf7; color: #287b5c; font-size: 12px; }
+.discovery-panel { margin-bottom: 0; }
+.discovery-panel-heading { align-items: flex-start; }
+.discovery-panel-heading h2 { margin-top: 3px; }
+.discovery-layout { display: grid; grid-template-columns: minmax(145px, .7fr) minmax(190px, 1fr) minmax(320px, 2.2fr); gap: 14px; padding: 0 18px 18px; align-items: start; }
+.discovery-layout h3 { margin: 0 0 10px; color: #465067; font-size: 11px; font-weight: 800; }
+.schema-list, .discovery-table-list, .column-detail { min-width: 0; }
+.schema-button, .table-name-button { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 8px; padding: 10px; margin-bottom: 5px; border: 1px solid #e8eaf1; border-radius: 7px; background: #fff; color: #596176; text-align: left; font-size: 11px; overflow-wrap: anywhere; }
+.schema-button small, .table-name-button small { flex-shrink: 0; color: #9298a8; font-size: 9px; }
+.schema-button.active, .table-name-button.active { border-color: #cfd2ff; background: #f4f4ff; color: #4d54c9; }
+.table-name-list { max-height: 370px; overflow: auto; }
+.column-detail { padding: 13px; border: 1px solid #eff0f5; border-radius: 9px; background: #fdfdff; }
+.column-detail .table-scroll { max-width: 100%; }
+.column-detail table { min-width: 0; }
+.column-detail th, .column-detail td { padding: 9px 8px; }
+.discovery-panel .empty-state { padding: 18px 10px; }
+.discovery-panel .panel-footer { flex-wrap: wrap; }
+
+@media (max-width: 1050px) {
+  .discovery-layout { grid-template-columns: minmax(140px, .75fr) minmax(180px, 1fr); }
+  .column-detail { grid-column: 1 / -1; }
+}
+@media (max-width: 650px) {
+  .discovery-layout { grid-template-columns: 1fr; padding: 0 13px 14px; }
+  .column-detail { grid-column: auto; padding: 10px; }
+  .explorer-actions { align-items: stretch; flex-direction: column; }
+  .explorer-action-button { width: 100%; }
+  .discovery-panel-heading { padding: 15px 13px 12px; }
+}
+
+
+/* Live Projects page and creation form */
+.project-create-panel {
+  padding-bottom: 18px;
+  margin-bottom: 18px;
+}
+.project-create-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 14px;
+  padding: 0 18px;
+}
+.project-create-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+}
+.project-create-field label {
+  color: #697185;
+  font-size: 11px;
+  font-weight: 700;
+}
+.project-create-field input {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 10px 11px;
+  border: 1px solid #e3e6ef;
+  border-radius: 7px;
+  background: #fff;
+  color: #30384b;
+  font: inherit;
+  font-size: 12px;
+}
+.project-create-field input:focus {
+  outline: 2px solid #c9ccff;
+  outline-offset: 1px;
+  border-color: #6268d9;
+}
+.project-create-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.project-create-actions .secondary-button {
+  padding: 10px 12px;
+}
+@media (max-width: 900px) {
+  .project-create-form {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .project-create-actions {
+    grid-column: 1 / -1;
+  }
+}
+@media (max-width: 600px) {
+  .project-create-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .project-create-actions {
+    grid-column: auto;
+    flex-wrap: wrap;
+  }
+}
+
+/* API-backed operations pages. Empty states stay truthful; no sample metrics. */
+.operation-notice {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 13px 15px;
+  margin-bottom: 17px;
+  border: 1px solid #e6e8f1;
+  border-radius: 9px;
+  background: #fafbff;
+  color: #697185;
+  font-size: 11px;
+  line-height: 1.55;
+}
+.operation-notice strong { color: #30384b; font-size: 11px; }
+.operation-error {
+  padding: 14px 16px;
+  margin-bottom: 17px;
+  border: 1px solid #f0caca;
+  border-radius: 9px;
+  background: #fff8f8;
+  color: #8d3030;
+  font-size: 12px;
+}
+.operation-error p { margin: 6px 0 0; }
+.operation-error small { display: block; margin-top: 8px; color: #8d6262; line-height: 1.5; }
+.operation-state { padding: 26px; margin-bottom: 18px; color: #858da0; font-size: 12px; }
+.operation-metric { min-height: 128px; }
+.operation-monitoring-grid { margin-bottom: 18px; }
+.operation-status-list { padding: 0 18px 17px; }
+.operation-status-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 11px 2px;
+  border-bottom: 1px solid #f0f1f6;
+}
+.operation-status-row:last-child { border-bottom: 0; }
+.operation-status-row > strong { color: #30384b; font-size: 13px; }
+.operation-secondary { display: block; margin-top: 4px; color: #9298a7; font-size: 10px; }
+.operation-json {
+  max-width: 380px;
+  max-height: 220px;
+  overflow: auto;
+  margin-top: 8px;
+  padding: 10px;
+  border-radius: 6px;
+  background: #f7f8fc;
+  color: #4e576d;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 10px;
+}
+.operation-empty { padding: 0 18px 18px; color: #8a91a2; font-size: 12px; }
+.settings-panel { margin-bottom: 17px; }
+.operation-details { margin: 0; padding: 0 18px 18px; }
+.operation-details > div {
+  display: grid;
+  grid-template-columns: minmax(130px, .7fr) minmax(0, 1.8fr);
+  gap: 16px;
+  padding: 12px 0;
+  border-top: 1px solid #f0f1f6;
+}
+.operation-details dt { color: #858da0; font-size: 11px; }
+.operation-details dd { margin: 0; color: #30384b; font-size: 11px; overflow-wrap: anywhere; }
+.operation-details code { font-size: 10px; }
+@media (max-width: 650px) {
+  .operation-details > div { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .operation-monitoring-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

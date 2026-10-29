@@ -1,11 +1,13 @@
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ApiDatabaseInstance, ApiProject, AuthStatus, Role, Session, Tenant } from "./app/app-types";
 import AuthScreen from "./features/auth/components/AuthScreen";
 import { revokeLoginSessionBestEffort } from "./app/revoke-login-session";
 import "./App.css";
 import { isWorkspaceDataCurrent } from "./tenant-visibility";
 import { loadWorkspaceData } from "./workspace-data-loader";
+import DatabaseExplorer from "./features/instances/components/DatabaseExplorer";
+import OperationsPage, { type OperationsPageName } from "./features/operations/components/OperationsPage";
 
 
 
@@ -156,6 +158,17 @@ function projectsNameForSearch(projectId: string, projects: ApiProject[]): strin
   return projects.find((project) => project.id === projectId)?.name ?? "";
 }
 
+function isOperationsPage(page: string): page is OperationsPageName {
+  return [
+    "Migrations",
+    "Backups",
+    "Monitoring",
+    "Audit log",
+    "Users & access",
+    "Settings",
+  ].includes(page);
+}
+
 function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus>("loading");
   const [authNotice, setAuthNotice] = useState("");
@@ -163,6 +176,8 @@ function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [availableTenants, setAvailableTenants] = useState<Tenant[]>([]);
   const [selectedTenantId, setSelectedTenantId] = useState("");
+  const selectedTenantIdRef = useRef(selectedTenantId);
+  selectedTenantIdRef.current = selectedTenantId;
   const [authError, setAuthError] = useState("");
   const [loginEmail, setLoginEmail] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
@@ -171,6 +186,11 @@ function App() {
   const [activePage, setActivePage] = useState("Overview");
   const [search, setSearch] = useState("");
   const [environment, setEnvironment] = useState("All environments");
+  const [projectFormOpen, setProjectFormOpen] = useState(false);
+  const [projectKeyInput, setProjectKeyInput] = useState("");
+  const [projectNameInput, setProjectNameInput] = useState("");
+  const [projectCreateBusy, setProjectCreateBusy] = useState(false);
+  const [projectCreateError, setProjectCreateError] = useState("");
 
   const [apiProjects, setApiProjects] = useState<ApiProject[]>([]);
   const [apiInstances, setApiInstances] = useState<ApiDatabaseInstance[]>([]);
@@ -269,7 +289,7 @@ function App() {
     void loadWorkspaceData<ApiProject, ApiDatabaseInstance>(
       selectedTenantId,
       {
-        fetcher: fetch,
+        fetcher: (input, init) => window.fetch(input, init),
         isCancelled: () => cancelled,
         readError: readApiError,
         onSuccess: (projects, instances) => {
@@ -351,6 +371,80 @@ function App() {
 
   const canManage = role === "super_admin" || role === "admin";
   const isViewer = role === "viewer";
+
+  async function handleCreateProject(
+    event: React.FormEvent<HTMLFormElement>,
+  ) {
+    event.preventDefault();
+
+    if (!canManage || !selectedTenantId) {
+      setProjectCreateError("You do not have permission to create a project in this workspace.");
+      return;
+    }
+
+    const tenantIdAtSubmit = selectedTenantId;
+    const csrfToken = readCsrfCookie();
+
+    if (!csrfToken) {
+      setProjectCreateError("The security token is missing. Refresh the page and try again.");
+      return;
+    }
+
+    setProjectCreateBusy(true);
+    setProjectCreateError("");
+
+    try {
+      const response = await fetch("/api/projects", {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": csrfToken,
+          "X-Tenant-Id": tenantIdAtSubmit,
+        },
+        body: JSON.stringify({
+          project_key: projectKeyInput.trim(),
+          name: projectNameInput.trim(),
+        }),
+      });
+
+      if (response.status === 401) {
+        handleExpiredSession();
+        return;
+      }
+
+      if (!response.ok) {
+        throw new Error(await readApiError(response));
+      }
+
+      const body = await response.json() as { data?: ApiProject };
+      const createdProject = body.data;
+
+      if (!createdProject || createdProject.tenant_id !== tenantIdAtSubmit) {
+        throw new Error("The API returned an invalid project response.");
+      }
+
+      // Never place a response from an old workspace into the current one.
+      if (selectedTenantIdRef.current === tenantIdAtSubmit) {
+        setApiProjects((current) => [
+          createdProject,
+          ...current.filter((project) => project.id !== createdProject.id),
+        ]);
+        setWorkspaceDataTenantId(tenantIdAtSubmit);
+        setProjectFormOpen(false);
+        setProjectKeyInput("");
+        setProjectNameInput("");
+      }
+    } catch (error) {
+      if (selectedTenantIdRef.current === tenantIdAtSubmit) {
+        setProjectCreateError(
+          error instanceof Error ? error.message : "Unable to create the project.",
+        );
+      }
+    } finally {
+      setProjectCreateBusy(false);
+    }
+  }
 
   async function handleLogin(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -461,6 +555,29 @@ function App() {
         error instanceof Error ? error.message : "Unable to sign out.",
       );
     }
+  }
+
+  function handleExpiredSession() {
+    setSession(null);
+    setAvailableTenants([]);
+    setSelectedTenantId("");
+    setWorkspaceDataTenantId("");
+    setApiProjects([]);
+    setApiInstances([]);
+    setDataError("");
+    setDataLoading(false);
+    setLoginPassword("");
+    setAuthError("Your session has expired. Please sign in again.");
+    setAuthStatus("unauthenticated");
+  }
+
+  function handleInstanceStatusChange(
+    instanceId: string,
+    status: ApiDatabaseInstance["status"],
+  ) {
+    setApiInstances((current) => current.map((instance) =>
+      instance.id === instanceId ? { ...instance, status } : instance,
+    ));
   }
 
   if (authStatus === "loading") {
@@ -594,7 +711,6 @@ function App() {
                 >
                   <Icon name={item.icon} />
                   <span>{item.label}</span>
-                  {item.label === "Backups" && <span className="nav-count">2</span>}
                 </button>
               ))}
             </div>
@@ -663,7 +779,7 @@ function App() {
             <>
               <section className="page-heading">
                 <div><p className="eyebrow">WORKSPACE OVERVIEW</p><h1>Welcome back.</h1><p className="subtitle">Projects and database instances for the selected workspace.</p></div>
-                {canManage && <button className="primary-button" onClick={() => setActivePage("Projects")}><Icon name="plus" size={17} /> New project</button>}
+                {canManage && <button className="primary-button" onClick={() => { setActivePage("Projects"); setProjectFormOpen(true); setProjectCreateError(""); }}><Icon name="plus" size={17} /> New project</button>}
               </section>
 
               <section className="metric-grid" aria-label="Workspace metrics">
@@ -775,6 +891,190 @@ function App() {
               </section>
               <footer className="page-footer"><span>pgcontrol <span>·</span> Database management platform</span><span><i className="status-dot" /> Signed in as {session.email}</span></footer>
             </>
+          ) : activePage === "Projects" ? (
+            <>
+              <section className="page-heading">
+                <div>
+                  <p className="eyebrow">WORKSPACE / PROJECTS</p>
+                  <h1>Projects</h1>
+                  <p className="subtitle">
+                    Live project records from the selected workspace.
+                  </p>
+                </div>
+                {canManage && (
+                  <button
+                    className="primary-button"
+                    onClick={() => {
+                      setProjectFormOpen((open) => !open);
+                      setProjectCreateError("");
+                    }}
+                  >
+                    <Icon name="plus" size={17} />
+                    {projectFormOpen ? "Close form" : "New project"}
+                  </button>
+                )}
+              </section>
+
+              {projectCreateError && (
+                <p className="auth-error" role="alert">{projectCreateError}</p>
+              )}
+
+              {projectFormOpen && canManage && (
+                <section className="panel project-create-panel" aria-labelledby="project-create-heading">
+                  <div className="panel-heading">
+                    <div>
+                      <h2 id="project-create-heading">Register a project</h2>
+                      <p>The project will belong to the currently selected workspace.</p>
+                    </div>
+                  </div>
+                  <form
+                    className="project-create-form"
+                    onSubmit={(event) => void handleCreateProject(event)}
+                  >
+                    <div className="project-create-field">
+                      <label htmlFor="project-name">Project name</label>
+                      <input
+                        id="project-name"
+                        value={projectNameInput}
+                        onChange={(event) => setProjectNameInput(event.target.value)}
+                        maxLength={200}
+                        autoComplete="off"
+                        required
+                        placeholder="Minecore Platform"
+                      />
+                    </div>
+                    <div className="project-create-field">
+                      <label htmlFor="project-key">Project key</label>
+                      <input
+                        id="project-key"
+                        value={projectKeyInput}
+                        onChange={(event) => setProjectKeyInput(event.target.value)}
+                        minLength={1}
+                        maxLength={100}
+                        pattern="[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}"
+                        title="Use 1–100 letters, numbers, dots, underscores, or hyphens; start with a letter or number."
+                        autoComplete="off"
+                        required
+                        placeholder="minecore-tools"
+                      />
+                    </div>
+                    <div className="project-create-actions">
+                      <button className="primary-button" type="submit" disabled={projectCreateBusy}>
+                        {projectCreateBusy ? "Creating…" : "Create project"}
+                      </button>
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        disabled={projectCreateBusy}
+                        onClick={() => {
+                          setProjectFormOpen(false);
+                          setProjectCreateError("");
+                        }}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </form>
+                </section>
+              )}
+
+              <section className="panel projects-panel">
+                <div className="panel-heading">
+                  <div>
+                    <h2>Registered projects</h2>
+                    <p>Results returned by the authenticated Projects API.</p>
+                  </div>
+                  <span className="result-count">
+                    {dataLoading ? "Loading…" : `${visibleProjects.length} shown`}
+                  </span>
+                </div>
+                <div className="table-scroll">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>PROJECT</th>
+                        <th>PROJECT KEY</th>
+                        <th>STATUS</th>
+                        <th>CREATED</th>
+                        <th />
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {visibleProjects.map((project) => (
+                        <tr key={project.id}>
+                          <td>
+                            <div className="project-cell">
+                              <span className="project-avatar">
+                                {project.project_key.slice(0, 1).toUpperCase()}
+                              </span>
+                              <span>
+                                <strong>{project.name}</strong>
+                                <small>{project.id}</small>
+                              </span>
+                            </div>
+                          </td>
+                          <td>{project.project_key}</td>
+                          <td><Status value={project.status} /></td>
+                          <td className="activity-time">
+                            {new Date(project.created_at).toLocaleDateString()}
+                          </td>
+                          <td>
+                            <button
+                              className="row-action"
+                              aria-label={`View database instances for ${project.name}`}
+                              onClick={() => setActivePage("Databases")}
+                            >
+                              <Icon name="chevron" size={16} />
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                      {!dataLoading && !dataError && visibleProjects.length === 0 && (
+                        <tr>
+                          <td colSpan={5} className="empty-state">
+                            {search
+                              ? "No projects match your search."
+                              : "No projects are registered in this workspace yet."}
+                          </td>
+                        </tr>
+                      )}
+                      {dataLoading && (
+                        <tr><td colSpan={5} className="empty-state">Loading projects…</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="panel-footer">
+                  <span>{dataLoading ? "Loading workspace data" : "Live API results"}</span>
+                  <button onClick={() => setActivePage("Overview")}>
+                    Back to overview <Icon name="arrow" size={14} />
+                  </button>
+                </div>
+              </section>
+              <footer className="page-footer">
+                <span>pgcontrol <span>·</span> Database management platform</span>
+                <span><i className="status-dot" /> Signed in as {session.email}</span>
+              </footer>
+            </>
+          ) : activePage === "Databases" ? (
+            <DatabaseExplorer
+              key={selectedTenantId}
+              tenantId={selectedTenantId}
+              instances={currentApiInstances}
+              projects={currentApiProjects}
+              canVerify={role !== "viewer"}
+              onSessionExpired={handleExpiredSession}
+              onInstanceStatusChange={handleInstanceStatusChange}
+            />
+          ) : isOperationsPage(activePage) ? (
+            <OperationsPage
+              key={`${activePage}:${selectedTenantId}`}
+              page={activePage}
+              tenantId={selectedTenantId}
+              workspace={selectedWorkspace}
+              session={session}
+              onSessionExpired={handleExpiredSession}
+            />
           ) : (
             <section className="placeholder-page">
               <span className="placeholder-icon"><Icon name={navigation.flatMap((group) => group.items).find((item) => item.label === activePage)?.icon ?? "grid"} size={25} /></span>

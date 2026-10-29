@@ -35,6 +35,10 @@ import {
   verifyDatabaseConnection,
   type DatabaseVerificationResult,
 } from "./services/database-connection-verifier.js";
+import {
+  discoverDatabaseMetadata,
+  type DatabaseDiscoveryResult,
+} from "./services/database-discovery.js";
 import { getTrustedProvisioningServer } from "./config/provisioning-server.js";
 import {
   DatabaseProvisioningError,
@@ -68,6 +72,21 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Invalid request.";
 }
 
+function parsePagination(query: { limit?: string; offset?: string }): {
+  limit: number;
+  offset: number;
+} | null {
+  const limit = Number(query.limit ?? 50);
+  const offset = Number(query.offset ?? 0);
+  if (
+    !Number.isInteger(limit) || limit < 1 || limit > 100 ||
+    !Number.isInteger(offset) || offset < 0
+  ) {
+    return null;
+  }
+  return { limit, offset };
+}
+
 export type DatabaseConnectionVerifier = (
   server: TrustedDatabaseServer,
   databaseName: string,
@@ -78,12 +97,68 @@ export type DatabaseProvisioner = (
   databaseName: string,
 ) => Promise<void>;
 
+export type DatabaseDiscoverer = (
+  server: TrustedDatabaseServer,
+  databaseName: string,
+) => Promise<DatabaseDiscoveryResult>;
+
 export interface CreateAppOptions {
   verifyConnection?: DatabaseConnectionVerifier;
   getTrustedServer?: (serverKey: string) => TrustedDatabaseServer;
   provisionDatabase?: DatabaseProvisioner;
   getProvisioningServer?: (serverKey: string) => TrustedDatabaseServer;
+  discoverDatabase?: DatabaseDiscoverer;
   loginThrottle?: ReturnType<typeof createLoginThrottle>;
+}
+
+const AUDIT_DETAIL_STRING_FIELDS = [
+  "status_before",
+  "status_after",
+  "verification_code",
+  "discovery_code",
+] as const;
+
+const AUDIT_DETAIL_NUMBER_FIELDS = [
+  "duration_ms",
+  "schema_count",
+  "table_count",
+] as const;
+
+/**
+ * Return only approved, non-secret metadata for the workspace audit UI.
+ * Stored audit records remain unchanged.
+ */
+export function sanitizeAuditDetails(
+  value: unknown,
+): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  const source = value as Record<string, unknown>;
+  const safe: Record<string, unknown> = {};
+
+  for (const key of AUDIT_DETAIL_STRING_FIELDS) {
+    const candidate = source[key];
+
+    if (typeof candidate === "string" && candidate.length <= 64) {
+      safe[key] = candidate;
+    }
+  }
+
+  for (const key of AUDIT_DETAIL_NUMBER_FIELDS) {
+    const candidate = source[key];
+
+    if (
+      typeof candidate === "number" &&
+      Number.isFinite(candidate) &&
+      candidate >= 0
+    ) {
+      safe[key] = candidate;
+    }
+  }
+
+  return safe;
 }
 
 export function createApp(executor: SqlExecutor, options: CreateAppOptions = {}) {
@@ -119,6 +194,8 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
   const provision = options.provisionDatabase ?? provisionDatabase;
   const resolveProvisioningServer =
     options.getProvisioningServer ?? getTrustedProvisioningServer;
+  const discoverDatabase =
+    options.discoverDatabase ?? discoverDatabaseMetadata;
 
   // Fail-closed authentication, CSRF, tenant resolution, and route authorization.
   app.addHook("preHandler", async (request, reply) => {
@@ -307,11 +384,46 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
         return;
       }
 
+      // Read-only operations pages are tenant-scoped and fail closed by default.
+      const operationsReadRoutes = new Set([
+        "/api/migration-runs",
+        "/api/backup-runs",
+        "/api/monitoring",
+        "/api/audit-events",
+        "/api/users",
+        "/api/settings",
+      ]);
+      if (operationsReadRoutes.has(pathname) && request.method === "GET") {
+        if (!context.subject.permissions.includes("database-instance:read")) {
+          return reply.code(403).send({
+            error: "Workspace operations data is not permitted.",
+          });
+        }
+
+        if (
+          pathname === "/api/users" &&
+          context.role !== "super_admin" &&
+          context.role !== "admin"
+        ) {
+          return reply.code(403).send({
+            error: "User and access directory is available only to workspace administrators.",
+          });
+        }
+
+        return;
+      }
+
       const instanceRoute = pathname.match(
-        /^\/api\/database-instances\/([^/]+)\/(provision|verify)$/,
+        /^\/api\/database-instances\/([^/]+)\/(provision|verify|discovery)$/,
       );
 
-      if (instanceRoute && request.method === "POST") {
+      const isDiscoveryRead =
+        instanceRoute?.[2] === "discovery" && request.method === "GET";
+      const isLifecycleWrite =
+        (instanceRoute?.[2] === "provision" || instanceRoute?.[2] === "verify") &&
+        request.method === "POST";
+
+      if (instanceRoute && (isDiscoveryRead || isLifecycleWrite)) {
         const params = request.params as { id?: string };
         const id = params.id;
 
@@ -327,7 +439,10 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
           });
         }
 
-        const allowed = permits(context, "database-instance:update", {
+        const action: AccessPermission = isDiscoveryRead
+          ? "database-instance:read"
+          : "database-instance:update";
+        const allowed = permits(context, action, {
           type: "database-instance",
           id: instance.id,
           tenantId: context.tenant.id,
@@ -336,7 +451,9 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
 
         if (!allowed) {
           return reply.code(403).send({
-            error: "Database instance operation is not permitted.",
+            error: isDiscoveryRead
+              ? "Database discovery is not permitted for this instance."
+              : "Database instance operation is not permitted.",
           });
         }
 
@@ -739,6 +856,264 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
   });
 
 
+  app.get<{
+    Querystring: { limit?: string; offset?: string };
+  }>("/api/migration-runs", async (request, reply) => {
+    const context = requestContexts.get(request)!;
+    const pagination = parsePagination(request.query);
+    if (!pagination) {
+      return reply.code(400).send({
+        error: "limit must be 1-100 and offset must be a non-negative integer.",
+      });
+    }
+
+    try {
+      const result = await executor.query(
+        `SELECT
+           mr.id,
+           mr.database_instance_id,
+           di.database_name,
+           di.environment,
+           p.project_key,
+           p.name AS project_name,
+           mr.migration_version,
+           mr.status,
+           mr.started_at,
+           mr.finished_at,
+           mr.error_summary
+         FROM public.migration_runs AS mr
+         JOIN public.database_instances AS di
+           ON di.id = mr.database_instance_id
+         JOIN public.projects AS p ON p.id = di.project_id
+         WHERE p.tenant_id = $1
+           AND p.id = ANY($2::uuid[])
+         ORDER BY mr.started_at DESC, mr.id DESC
+         LIMIT $3 OFFSET $4`,
+        [context.tenant.id, context.subject.projectIds, pagination.limit, pagination.offset],
+      );
+      return {
+        data: result.rows,
+        pagination: { ...pagination, count: result.rows.length },
+      };
+    } catch (error) {
+      request.log.error({ err: error }, "Failed to list migration runs");
+      return reply.code(500).send({ error: "Migration history is unavailable. Confirm the operations read-permissions migration is applied." });
+    }
+  });
+
+  app.get<{
+    Querystring: { limit?: string; offset?: string };
+  }>("/api/backup-runs", async (request, reply) => {
+    const context = requestContexts.get(request)!;
+    const pagination = parsePagination(request.query);
+    if (!pagination) {
+      return reply.code(400).send({
+        error: "limit must be 1-100 and offset must be a non-negative integer.",
+      });
+    }
+
+    try {
+      const result = await executor.query(
+        `SELECT
+           br.id,
+           br.database_instance_id,
+           di.database_name,
+           di.environment,
+           p.project_key,
+           p.name AS project_name,
+           br.status,
+           br.started_at,
+           br.finished_at,
+           br.restore_tested_at,
+           br.checksum_sha256,
+           (br.backup_location IS NOT NULL) AS location_recorded
+         FROM public.backup_runs AS br
+         JOIN public.database_instances AS di
+           ON di.id = br.database_instance_id
+         JOIN public.projects AS p ON p.id = di.project_id
+         WHERE p.tenant_id = $1
+           AND p.id = ANY($2::uuid[])
+         ORDER BY br.started_at DESC, br.id DESC
+         LIMIT $3 OFFSET $4`,
+        [context.tenant.id, context.subject.projectIds, pagination.limit, pagination.offset],
+      );
+      return {
+        data: result.rows,
+        pagination: { ...pagination, count: result.rows.length },
+      };
+    } catch (error) {
+      request.log.error({ err: error }, "Failed to list backup runs");
+      return reply.code(500).send({ error: "Backup history is unavailable. Confirm the operations read-permissions migration is applied." });
+    }
+  });
+
+  app.get("/api/monitoring", async (request, reply) => {
+    const context = requestContexts.get(request)!;
+    try {
+      // This is registry monitoring, not a live connection probe of every target.
+      await executor.query("SELECT 1");
+      const result = await executor.query<{ status: string; count: number | string }>(
+        `SELECT di.status, COUNT(*)::int AS count
+         FROM public.database_instances AS di
+         JOIN public.projects AS p ON p.id = di.project_id
+         WHERE p.tenant_id = $1
+           AND p.id = ANY($2::uuid[])
+         GROUP BY di.status`,
+        [context.tenant.id, context.subject.projectIds],
+      );
+
+      const counts: Record<string, number> = {
+        planned: 0,
+        provisioning: 0,
+        ready: 0,
+        failed: 0,
+        retired: 0,
+      };
+      for (const row of result.rows) {
+        if (Object.prototype.hasOwnProperty.call(counts, row.status)) {
+          counts[row.status] = Number(row.count);
+        }
+      }
+
+      return {
+        data: {
+          checked_at: new Date().toISOString(),
+          control_database: "connected",
+          target_connections: "not_probed",
+          total_instances: Object.values(counts).reduce((sum, value) => sum + value, 0),
+          instances_by_status: counts,
+        },
+      };
+    } catch (error) {
+      request.log.error({ err: error }, "Failed to retrieve monitoring summary");
+      return reply.code(503).send({
+        error: "Monitoring data is temporarily unavailable.",
+      });
+    }
+  });
+
+  app.get<{
+    Querystring: { limit?: string; offset?: string };
+  }>("/api/audit-events", async (request, reply) => {
+    const context = requestContexts.get(request)!;
+    const pagination = parsePagination(request.query);
+    if (!pagination) {
+      return reply.code(400).send({
+        error: "limit must be 1-100 and offset must be a non-negative integer.",
+      });
+    }
+
+    try {
+      // audit_events has no tenant_id column. Scope rows through their registered
+      // project/database targets and the caller's authorized project IDs.
+      const result = await executor.query(
+        `SELECT ae.id, ae.actor, ae.action, ae.target, ae.outcome, ae.details, ae.created_at
+         FROM public.audit_events AS ae
+         WHERE EXISTS (
+           SELECT 1
+           FROM public.projects AS p
+           WHERE p.tenant_id = $1
+             AND p.id = ANY($2::uuid[])
+             AND (
+               ae.target = 'project:' || p.id::text
+               OR EXISTS (
+                 SELECT 1
+                 FROM public.database_instances AS di
+                 WHERE di.project_id = p.id
+                   AND ae.target = 'database_instance:' || di.id::text
+               )
+             )
+         )
+         ORDER BY ae.created_at DESC, ae.id DESC
+         LIMIT $3 OFFSET $4`,
+        [context.tenant.id, context.subject.projectIds, pagination.limit, pagination.offset],
+      );
+      return {
+        data: result.rows.map((event) => ({
+          ...event,
+          details: sanitizeAuditDetails(event.details),
+        })),
+        pagination: { ...pagination, count: result.rows.length },
+      };
+    } catch (error) {
+      request.log.error({ err: error }, "Failed to list audit events");
+      return reply.code(500).send({
+        error: "Audit history is unavailable. Confirm the operations read-permissions migration is applied.",
+      });
+    }
+  });
+
+  app.get("/api/settings", async (request) => {
+    const context = requestContexts.get(request)!;
+    const session = requestSessions.get(request)!;
+    return {
+      data: {
+        account: {
+          id: session.user_id,
+          email: session.email,
+          is_super_admin: session.is_super_admin,
+          status: session.user_status,
+        },
+        workspace: {
+          tenant_id: context.tenant.id,
+          tenant_key: context.tenant.tenant_key,
+          tenant_name: context.tenant.name,
+          tenant_status: context.tenant.status,
+          role: context.role,
+        },
+        editable_settings_available: false,
+      },
+    };
+  });
+
+  app.get<{
+    Querystring: { limit?: string; offset?: string };
+  }>("/api/users", async (request, reply) => {
+    const context = requestContexts.get(request)!;
+    const pagination = parsePagination(request.query);
+    if (!pagination) {
+      return reply.code(400).send({
+        error: "limit must be 1-100 and offset must be a non-negative integer.",
+      });
+    }
+
+    try {
+      const result = await executor.query(
+        `SELECT
+           u.id,
+           u.email,
+           u.status,
+           u.is_super_admin,
+           m.role,
+           CASE
+             WHEN m.role = 'admin' THEN (
+               SELECT COUNT(*)::int
+               FROM public.projects AS accessible_projects
+               WHERE accessible_projects.tenant_id = $1
+             )
+             ELSE COUNT(DISTINCT pa.project_id)::int
+           END AS assigned_project_count
+         FROM public.tenant_memberships AS m
+         JOIN public.users AS u ON u.id = m.user_id
+         LEFT JOIN public.project_assignments AS pa
+           ON pa.user_id = m.user_id
+          AND pa.tenant_id = m.tenant_id
+         WHERE m.tenant_id = $1
+         GROUP BY u.id, u.email, u.status, u.is_super_admin, m.role
+         ORDER BY u.email, u.id
+         LIMIT $2 OFFSET $3`,
+        [context.tenant.id, pagination.limit, pagination.offset],
+      );
+      return {
+        data: result.rows,
+        pagination: { ...pagination, count: result.rows.length },
+      };
+    } catch (error) {
+      request.log.error({ err: error }, "Failed to list tenant users");
+      return reply.code(500).send({ error: "Unable to retrieve workspace access directory." });
+    }
+  });
+
   app.post<{
     Params: { id: string };
   }>("/api/database-instances/:id/provision", async (request, reply) => {
@@ -939,6 +1314,105 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
     });
   });
 
+  app.get<{
+    Params: { id: string };
+  }>("/api/database-instances/:id/discovery", async (request, reply) => {
+    const { id } = request.params;
+
+    if (!isUuid(id)) {
+      return reply.code(400).send({ error: "id must be a valid UUID." });
+    }
+
+    const context = requestContexts.get(request);
+    if (!context) {
+      return reply.code(401).send({ error: "Authentication required." });
+    }
+
+    let instance: DatabaseInstance | null;
+    try {
+      instance = await instances.getById(id, context.tenant.id);
+    } catch (error) {
+      request.log.error(
+        { err: error },
+        "Failed to retrieve database instance for discovery",
+      );
+      return reply.code(500).send({ error: "Unable to retrieve database instance." });
+    }
+
+    if (!instance) {
+      return reply.code(404).send({ error: "Database instance not found." });
+    }
+
+    if (instance.status !== "ready") {
+      return reply.code(409).send({
+        error: "Database discovery requires a ready database instance.",
+        lifecycleStatus: instance.status,
+      });
+    }
+
+    let discovery: DatabaseDiscoveryResult;
+    try {
+      const server = resolveTrustedServer(instance.server_key);
+      discovery = await discoverDatabase(server, instance.database_name);
+    } catch {
+      discovery = {
+        ok: false,
+        code: "CONFIGURATION_ERROR",
+        message: "Trusted database discovery configuration is unavailable.",
+      };
+    }
+
+    const auditOutcome: "succeeded" | "failed" = discovery.ok ? "succeeded" : "failed";
+    const auditDetails = discovery.ok
+      ? {
+          tenant_id: context.tenant.id,
+          server_key: instance.server_key,
+          database_name: instance.database_name,
+          schema_count: discovery.schemas.length,
+          table_count: discovery.tables.length,
+        }
+      : {
+          tenant_id: context.tenant.id,
+          server_key: instance.server_key,
+          database_name: instance.database_name,
+          discovery_code: discovery.code,
+        };
+
+    try {
+      await executor.query(
+        `INSERT INTO public.audit_events
+          (id, actor, action, target, outcome, details)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+        [
+          randomUUID(),
+          context.userId,
+          "database.schema.discover",
+          `database_instance:${instance.id}`,
+          auditOutcome,
+          JSON.stringify(auditDetails),
+        ],
+      );
+    } catch (error) {
+      request.log.error(
+        { err: error },
+        "Failed to record database discovery audit event",
+      );
+      return reply.code(500).send({
+        error: "Unable to record database discovery audit event.",
+      });
+    }
+
+    if (!discovery.ok) {
+      const statusCode = discovery.code === "CONNECTION_FAILED" ? 502 : 500;
+      return reply.code(statusCode).send({
+        error: discovery.message,
+        code: discovery.code,
+      });
+    }
+
+    return reply.code(200).send({ data: discovery });
+  });
+
   app.post<{
     Params: { id: string };
   }>("/api/database-instances/:id/verify", async (request, reply) => {
@@ -1012,7 +1486,10 @@ export function createApp(executor: SqlExecutor, options: CreateAppOptions = {})
           FROM current_instance AS ci
           WHERE di.id = ci.id
             AND di.status = ci.status
-            AND ci.status IN ('planned', 'provisioning')
+            AND (
+              ci.status IN ('planned', 'provisioning')
+              OR (ci.status = 'failed' AND $2::boolean)
+            )
           RETURNING
             di.id,
             ci.status AS status_before,

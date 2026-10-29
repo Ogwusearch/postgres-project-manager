@@ -179,6 +179,7 @@ test(
       assert.equal(fresh.code, 0, fresh.stderr);
       assert.match(fresh.stdout, /Applied: 001_initial_registry\.sql/);
       assert.match(fresh.stdout, /Applied: 002_auth_and_tenancy\.sql/);
+      assert.match(fresh.stdout, /Applied: 003_operations_read_permissions\.sql/);
 
       const tables = await client.query<{ tablename: string }>(`
         SELECT tablename
@@ -203,7 +204,7 @@ test(
           "users",
         ],
       );
-      assert.equal(await historyCount(client), 2);
+      assert.equal(await historyCount(client), 3);
 
       // Verify the database enforces tenant-scoped ownership.
       const tenantColumn = await client.query<{ attnotnull: boolean }>(`
@@ -357,7 +358,8 @@ test(
       assert.equal(repeated.code, 0, repeated.stderr);
       assert.match(repeated.stdout, /Already applied: 001_initial_registry\.sql/);
       assert.match(repeated.stdout, /Already applied: 002_auth_and_tenancy\.sql/);
-      assert.equal(await historyCount(client), 2);
+      assert.match(repeated.stdout, /Already applied: 003_operations_read_permissions\.sql/);
+      assert.equal(await historyCount(client), 3);
 
       // 3. Checksum drift must be rejected.
       await client.query(`
@@ -404,7 +406,7 @@ test(
         null,
       );
 
-      // Explicit baseline records 001 and applies migration 002.
+      // Explicit baseline records 001 and applies remaining migrations 002 and 003.
       const explicitBaseline = await runRunner(["--baseline-existing"]);
       assert.equal(explicitBaseline.code, 0, explicitBaseline.stderr);
       assert.match(
@@ -415,7 +417,11 @@ test(
         explicitBaseline.stdout,
         /Applied: 002_auth_and_tenancy\.sql/,
       );
-      assert.equal(await historyCount(client), 2);
+      assert.match(
+        explicitBaseline.stdout,
+        /Applied: 003_operations_read_permissions\.sql/,
+      );
+      assert.equal(await historyCount(client), 3);
 
       // 6. History without registry tables must be rejected.
       await resetPublicSchema(client);
@@ -499,7 +505,7 @@ test(
 
       assert.equal(firstResult.code, 0, firstResult.stderr);
       assert.equal(secondResult.code, 0, secondResult.stderr);
-      assert.equal(await historyCount(client), 2);
+      assert.equal(await historyCount(client), 3);
 
       const finalTables = await client.query<{ tablename: string }>(`
         SELECT tablename

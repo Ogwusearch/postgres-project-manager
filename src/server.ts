@@ -41,7 +41,7 @@ async function start() {
     });
     app.log.info("PostgreSQL Project Manager API started");
   } catch (error) {
-    app.log.error({ err: error }, "API startup failed");
+    console.error("API startup failed:", error);
     await pool.end();
     process.exitCode = 1;
   }

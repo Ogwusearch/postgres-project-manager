@@ -56,7 +56,10 @@ const verificationSql = `
     FROM current_instance AS ci
     WHERE di.id = ci.id
       AND di.status = ci.status
-      AND ci.status IN ('planned', 'provisioning')
+      AND (
+              ci.status IN ('planned', 'provisioning')
+              OR (ci.status = 'failed' AND $2::boolean)
+            )
     RETURNING
       di.id,
       ci.status AS status_before,
@@ -112,6 +115,7 @@ test("PostgreSQL verification status and audit are atomic", async () => {
     const projectId = randomUUID();
     const successId = randomUUID();
     const failureId = randomUUID();
+    const recoveryId = randomUUID();
     const duplicateAuditId = randomUUID();
     const suffix = randomUUID().replaceAll("-", "").slice(0, 16);
 
@@ -137,13 +141,16 @@ test("PostgreSQL verification status and audit are atomic", async () => {
          (id, project_id, environment, database_name, server_key, status)
        VALUES
          ($1, $2, 'development', $3, 'local-postgres', 'planned'),
-         ($4, $2, 'staging', $5, 'local-postgres', 'provisioning')`,
+         ($4, $2, 'staging', $5, 'local-postgres', 'provisioning'),
+         ($6, $2, 'production', $7, 'local-postgres', 'failed')`,
       [
         successId,
         projectId,
         `atomic_success_${suffix}`,
         failureId,
         `atomic_failure_${suffix}`,
+        recoveryId,
+        `atomic_recovery_${suffix}`,
       ],
     );
 
@@ -183,6 +190,45 @@ test("PostgreSQL verification status and audit are atomic", async () => {
     assert.equal(successAudit.rows[0].outcome, "succeeded");
     assert.equal(successAudit.rows[0].details.status_before, "planned");
     assert.equal(successAudit.rows[0].details.status_after, "ready");
+
+    // Successful verification must recover a previously failed instance.
+    await client.query('SET LOCAL ROLE ppm_registry_app');
+    const recovered = await client.query(verificationSql, [
+      recoveryId,
+      true,
+      randomUUID(),
+      "system",
+      "database.connection.verify",
+      `database_instance:${recoveryId}`,
+      "succeeded",
+      JSON.stringify({
+        verification_code: "RECOVERY_OK",
+        server_key: "local-postgres",
+        database_name: `atomic_recovery_${suffix}`,
+        duration_ms: 1,
+      }),
+      tenantId,
+    ]);
+    await client.query("RESET ROLE");
+    assert.equal(recovered.rows[0]?.lifecycle_status, "ready");
+
+    const recoveredStatus = await client.query(
+      "SELECT status FROM public.database_instances WHERE id = $1",
+      [recoveryId],
+    );
+    assert.equal(recoveredStatus.rows[0]?.status, "ready");
+
+    const recoveryAudit = await client.query(
+      `SELECT actor, action, outcome, details
+       FROM public.audit_events
+       WHERE target = $1
+         AND action = 'database.connection.verify'`,
+      [`database_instance:${recoveryId}`],
+    );
+    assert.equal(recoveryAudit.rows.length, 1);
+    assert.equal(recoveryAudit.rows[0].outcome, "succeeded");
+    assert.equal(recoveryAudit.rows[0].details.status_before, "failed");
+    assert.equal(recoveryAudit.rows[0].details.status_after, "ready");
 
     // Reserve an audit ID to force the next audit insert to fail.
     await client.query(

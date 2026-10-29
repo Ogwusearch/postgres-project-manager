@@ -94,6 +94,86 @@ function createTestPool(options: {
         return { rows: [{ "?column?": 1 }], rowCount: 1 };
       }
 
+      if (statement.includes("FROM public.migration_runs AS mr")) {
+        return {
+          rows: [{
+            id: "42a0f0e1-6734-4d87-97fd-4ecb1a000001",
+            database_instance_id: "42a0f0e1-6734-4d87-97fd-4ecb1a000002",
+            database_name: "solar_audit_dev",
+            environment: "development",
+            project_key: "solar-audit",
+            project_name: "SolarAudit",
+            migration_version: "001",
+            status: "succeeded",
+            started_at: new Date("2026-10-20T10:00:00.000Z"),
+            finished_at: new Date("2026-10-20T10:00:02.000Z"),
+          }],
+          rowCount: 1,
+        };
+      }
+
+      if (statement.includes("FROM public.backup_runs AS br")) {
+        return {
+          rows: [{
+            id: "43a0f0e1-6734-4d87-97fd-4ecb1a000001",
+            database_instance_id: "42a0f0e1-6734-4d87-97fd-4ecb1a000002",
+            database_name: "solar_audit_dev",
+            environment: "development",
+            project_key: "solar-audit",
+            project_name: "SolarAudit",
+            status: "succeeded",
+            started_at: new Date("2026-10-20T11:00:00.000Z"),
+            finished_at: new Date("2026-10-20T11:00:02.000Z"),
+            restore_tested_at: null,
+            checksum_sha256: "a".repeat(64),
+            location_recorded: true,
+          }],
+          rowCount: 1,
+        };
+      }
+
+      if (statement.includes("FROM public.audit_events AS ae")) {
+        return {
+          rows: [{
+            id: "44a0f0e1-6734-4d87-97fd-4ecb1a000001",
+            actor: testUserId,
+            action: "database.connection.verify",
+            target: "database_instance:42a0f0e1-6734-4d87-97fd-4ecb1a000002",
+            outcome: "succeeded",
+            details: { verification_code: "CONNECTION_OK" },
+            created_at: new Date("2026-10-20T11:05:00.000Z"),
+          }],
+          rowCount: 1,
+        };
+      }
+
+      if (statement.includes("GROUP BY di.status")) {
+        return {
+          rows: [
+            { status: "ready", count: 1 },
+            { status: "failed", count: 1 },
+          ],
+          rowCount: 2,
+        };
+      }
+
+      if (
+        statement.includes("FROM public.tenant_memberships AS m") &&
+        statement.includes("JOIN public.users AS u")
+      ) {
+        return {
+          rows: [{
+            id: testUserId,
+            email: "tenant-admin@example.test",
+            status: "active",
+            is_super_admin: false,
+            role: "admin",
+            assigned_project_count: 1,
+          }],
+          rowCount: 1,
+        };
+      }
+
       if (statement.startsWith("INSERT INTO public.projects")) {
         const [id, tenantId, projectKey, name, status] = values;
 
@@ -402,7 +482,11 @@ function createTestPool(options: {
 
         const statusBefore = String(instance.status);
 
-        if (statusBefore === "planned" || statusBefore === "provisioning") {
+        if (
+          statusBefore === "planned" ||
+          statusBefore === "provisioning" ||
+          (statusBefore === "failed" && verificationOk === true)
+        ) {
           instance.status = verificationOk ? "ready" : "failed";
         }
 
@@ -440,13 +524,14 @@ function createTestPool(options: {
         }
 
         const [id, actor, action, target, outcome, details] = values;
+        const parsedDetails = typeof details === "string" ? JSON.parse(details) : details;
         const row = {
           id,
           actor,
           action,
           target,
           outcome,
-          details,
+          details: parsedDetails,
           created_at: new Date(),
         };
         auditEvents.push(row);
@@ -551,6 +636,10 @@ function setup(
     getProvisioningServer?: (
       serverKey: string,
     ) => import("../src/config/database-servers.js").TrustedDatabaseServer;
+    discoverDatabase?: (
+      server: import("../src/config/database-servers.js").TrustedDatabaseServer,
+      databaseName: string,
+    ) => Promise<import("../src/services/database-discovery.js").DatabaseDiscoveryResult>;
   } = {},
 ) {
   const { pool, instances, auditEvents } = createTestPool(options);
@@ -595,6 +684,7 @@ function setup(
         connectTimeoutMs: 3000,
       };
     },
+    discoverDatabase: options.discoverDatabase,
   });
 
   return {
@@ -634,6 +724,95 @@ function verificationResult(
     ...overrides,
   };
 }
+
+test("operations APIs return tenant-scoped migration, backup, and audit history", async () => {
+  const { app } = setup();
+  try {
+    const migrations = await testInjectAsTenantAdmin(app, {
+      method: "GET",
+      url: "/api/migration-runs?limit=10&offset=0",
+    });
+    assert.equal(migrations.statusCode, 200);
+    assert.equal(migrations.json().data[0]?.migration_version, "001");
+
+    const backups = await testInjectAsTenantAdmin(app, {
+      method: "GET",
+      url: "/api/backup-runs?limit=10&offset=0",
+    });
+    assert.equal(backups.statusCode, 200);
+    assert.equal(backups.json().data[0]?.status, "succeeded");
+    assert.equal(backups.json().data[0]?.location_recorded, true);
+
+    const audit = await testInjectAsTenantAdmin(app, {
+      method: "GET",
+      url: "/api/audit-events?limit=10&offset=0",
+    });
+    assert.equal(audit.statusCode, 200);
+    assert.equal(audit.json().data[0]?.action, "database.connection.verify");
+  } finally {
+    await app.close();
+  }
+});
+
+test("settings API returns only the authenticated account and selected tenant context", async () => {
+  const { app } = setup();
+  try {
+    const response = await testInjectAsTenantAdmin(app, {
+      method: "GET",
+      url: "/api/settings",
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().data.account.email, "tenant-admin@example.test");
+    assert.equal(response.json().data.workspace.tenant_id, testTenantId);
+    assert.equal(response.json().data.workspace.role, "admin");
+    assert.equal(response.json().data.editable_settings_available, false);
+    assert.equal("password_hash" in response.json().data.account, false);
+  } finally {
+    await app.close();
+  }
+});
+
+test("monitoring API reports control readiness and registry status without claiming target probes", async () => {
+  const { app } = setup();
+  try {
+    const response = await testInjectAsTenantAdmin(app, {
+      method: "GET",
+      url: "/api/monitoring",
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().data.control_database, "connected");
+    assert.equal(response.json().data.target_connections, "not_probed");
+    assert.equal(response.json().data.instances_by_status.ready, 1);
+    assert.equal(response.json().data.instances_by_status.failed, 1);
+  } finally {
+    await app.close();
+  }
+});
+
+test("users directory is available to workspace admins but denied to viewers", async () => {
+  const { app } = setup();
+  try {
+    const adminResponse = await testInjectAsTenantAdmin(app, {
+      method: "GET",
+      url: "/api/users?limit=10&offset=0",
+    });
+    assert.equal(adminResponse.statusCode, 200);
+    assert.equal(adminResponse.json().data[0]?.email, "tenant-admin@example.test");
+    assert.equal("password_hash" in adminResponse.json().data[0], false);
+
+    const viewerResponse = await app.inject({
+      method: "GET",
+      url: "/api/users?limit=10&offset=0",
+      headers: {
+        cookie: `ppm_session=${testViewerSessionToken}; ppm_csrf=${testViewerCsrfToken}`,
+        "x-tenant-id": testTenantId,
+      },
+    });
+    assert.equal(viewerResponse.statusCode, 403);
+  } finally {
+    await app.close();
+  }
+});
 
 test("health endpoint reports database connected", async () => {
   const { app } = setup();
@@ -1055,6 +1234,252 @@ test("verification HTTP response and audit expose matching lifecycle statuses", 
   await app.close();
 });
 
+
+test("successful verification recovers a failed instance to ready and audits the transition", async () => {
+  const verifier: DatabaseConnectionVerifier = async () => verificationResult();
+  const { app, instances, auditEvents } = setup(verifier);
+  const instance = await registerTestInstance(app);
+  instances[0]!.status = "failed";
+
+  const response = await testInjectAsTenantAdmin(app, {
+    method: "POST",
+    url: `/api/database-instances/${instance.id}/verify`,
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().data.ok, true);
+  assert.equal(response.json().data.lifecycleStatus, "ready");
+  assert.equal(instances[0]?.status, "ready");
+  assert.equal(auditEvents.length, 1);
+  assert.equal(auditEvents[0]?.action, "database.connection.verify");
+  assert.equal(
+    (auditEvents[0]?.details as Record<string, unknown>).status_before,
+    "failed",
+  );
+  assert.equal(
+    (auditEvents[0]?.details as Record<string, unknown>).status_after,
+    "ready",
+  );
+
+  await app.close();
+});
+
+test("ready database instance discovery returns metadata and records an audit event", async () => {
+  const { app, instances, auditEvents } = setup(undefined, {
+    discoverDatabase: async (server, databaseName) => {
+      assert.equal(server.key, "local-postgres");
+      assert.equal(databaseName, "solar_audit_verify_test");
+      return {
+        ok: true,
+        databaseName,
+        discoveredAt: "2026-10-29T00:00:00.000Z",
+        schemas: ["public"],
+        tables: [{
+          schemaName: "public",
+          tableName: "example_table",
+          tableType: "BASE TABLE",
+          columns: [{
+            columnName: "id",
+            ordinalPosition: 1,
+            dataType: "uuid",
+            udtName: "uuid",
+            nullable: false,
+          }],
+        }],
+      };
+    },
+  });
+  const instance = await registerTestInstance(app);
+  instances[0]!.status = "ready";
+
+  try {
+    const response = await testInjectAsTenantAdmin(app, {
+      method: "GET",
+      url: `/api/database-instances/${instance.id}/discovery`,
+    });
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().data.databaseName, "solar_audit_verify_test");
+    assert.equal(response.json().data.tables[0].tableName, "example_table");
+    assert.equal(response.json().data.tables[0].columns[0].nullable, false);
+    assert.equal(auditEvents.length, 1);
+    assert.equal(auditEvents[0]?.action, "database.schema.discover");
+    assert.equal(auditEvents[0]?.outcome, "succeeded");
+  } finally {
+    await app.close();
+  }
+});
+
+test("database discovery requires an authenticated session", async () => {
+  let discoveryCalls = 0;
+  const { app } = setup(undefined, {
+    discoverDatabase: async (_server, databaseName) => {
+      discoveryCalls += 1;
+      return {
+        ok: true,
+        databaseName,
+        discoveredAt: new Date().toISOString(),
+        schemas: [],
+        tables: [],
+      };
+    },
+  });
+
+  try {
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/database-instances/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/discovery",
+    });
+    assert.equal(response.statusCode, 401);
+    assert.equal(discoveryCalls, 0);
+  } finally {
+    await app.close();
+  }
+});
+
+test("discovery rejects invalid IDs and instances that are not ready", async () => {
+  let discoveryCalls = 0;
+  const { app, instances, auditEvents } = setup(undefined, {
+    discoverDatabase: async (_server, databaseName) => {
+      discoveryCalls += 1;
+      return {
+        ok: true,
+        databaseName,
+        discoveredAt: new Date().toISOString(),
+        schemas: [],
+        tables: [],
+      };
+    },
+  });
+  const instance = await registerTestInstance(app);
+
+  try {
+    const invalid = await testInjectAsTenantAdmin(app, {
+      method: "GET",
+      url: "/api/database-instances/not-a-uuid/discovery",
+    });
+    assert.equal(invalid.statusCode, 400);
+
+    const notReady = await testInjectAsTenantAdmin(app, {
+      method: "GET",
+      url: `/api/database-instances/${instance.id}/discovery`,
+    });
+    assert.equal(notReady.statusCode, 409);
+    assert.equal(notReady.json().lifecycleStatus, "planned");
+    assert.equal(discoveryCalls, 0);
+    assert.equal(auditEvents.length, 0);
+
+    // A valid UUID with no tenant-owned instance must be rejected.
+    const missing = await testInjectAsTenantAdmin(app, {
+      method: "GET",
+      url: "/api/database-instances/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/discovery",
+    });
+    assert.equal(missing.statusCode, 404);
+  } finally {
+    await app.close();
+  }
+});
+
+test("discovery fails safely and audits target connection failures", async () => {
+  const { app, instances, auditEvents } = setup(undefined, {
+    discoverDatabase: async () => ({
+      ok: false,
+      code: "CONNECTION_FAILED",
+      message: "Unable to connect to the registered database for discovery.",
+    }),
+  });
+  const instance = await registerTestInstance(app);
+  instances[0]!.status = "ready";
+
+  try {
+    const response = await testInjectAsTenantAdmin(app, {
+      method: "GET",
+      url: `/api/database-instances/${instance.id}/discovery`,
+    });
+    assert.equal(response.statusCode, 502);
+    assert.equal(response.json().code, "CONNECTION_FAILED");
+    assert.doesNotMatch(response.body, /password|secret|127\.0\.0\.1/);
+    assert.equal(auditEvents.length, 1);
+    assert.equal(auditEvents[0]?.outcome, "failed");
+  } finally {
+    await app.close();
+  }
+});
+
+test("discovery fails closed when its audit event cannot be recorded", async () => {
+  const { app, instances, auditEvents } = setup(undefined, {
+    failAuditInsert: true,
+    discoverDatabase: async (_server, databaseName) => ({
+      ok: true,
+      databaseName,
+      discoveredAt: new Date().toISOString(),
+      schemas: ["public"],
+      tables: [{
+        schemaName: "public",
+        tableName: "private_names_must_not_be_returned",
+        tableType: "BASE TABLE",
+        columns: [],
+      }],
+    }),
+  });
+  const instance = await registerTestInstance(app);
+  instances[0]!.status = "ready";
+
+  try {
+    const response = await testInjectAsTenantAdmin(app, {
+      method: "GET",
+      url: `/api/database-instances/${instance.id}/discovery`,
+    });
+    assert.equal(response.statusCode, 500);
+    assert.equal(response.json().error, "Unable to record database discovery audit event.");
+    assert.doesNotMatch(response.body, /private_names_must_not_be_returned/);
+    assert.equal(auditEvents.length, 0);
+  } finally {
+    await app.close();
+  }
+});
+
+test("discovery rejects cross-tenant and unassigned project access before connecting", async () => {
+  let discoveryCalls = 0;
+  const { app } = setup(undefined, {
+    seedCrossTenant: true,
+    discoverDatabase: async (_server, databaseName) => {
+      discoveryCalls += 1;
+      return {
+        ok: true,
+        databaseName,
+        discoveredAt: new Date().toISOString(),
+        schemas: [],
+        tables: [],
+      };
+    },
+  });
+
+  try {
+    const crossTenant = await testInjectAsTenantAdmin(app, {
+      method: "GET",
+      url: `/api/database-instances/${crossTenantInstanceId}/discovery`,
+    });
+    assert.equal(crossTenant.statusCode, 404);
+
+    const instance = await registerTestInstance(app);
+    const viewerHeaders = {
+      cookie:
+        `ppm_session=${testViewerSessionToken}; ` +
+        `ppm_csrf=${testViewerCsrfToken}`,
+      "x-tenant-id": testTenantId,
+    };
+    const unassigned = await testInjectAsTenantAdmin(app, {
+      method: "GET",
+      url: `/api/database-instances/${instance.id}/discovery`,
+      headers: viewerHeaders,
+    });
+    assert.equal(unassigned.statusCode, 403);
+    assert.equal(discoveryCalls, 0);
+  } finally {
+    await app.close();
+  }
+});
 
 test("provisions a planned development database and records its audit", async () => {
   const { app, instances, auditEvents, getProvisionCalls } = setup();
