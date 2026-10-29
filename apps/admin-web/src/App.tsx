@@ -123,6 +123,8 @@ function Icon({ name, size = 18 }: { name: string; size?: number }) {
     history: <><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5M12 7v5l4 2" /></>,
     users: <><path d="M16 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="10" cy="7" r="4" /><path d="M20 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8" /></>,
     settings: <><circle cx="12" cy="12" r="3" /><path d="m19.4 15 .1.1 1.1 1.9-2 3.4-2.2-.5a8 8 0 0 1-2 .9L13.8 23h-3.6l-.6-2.2a8 8 0 0 1-2-.9l-2.2.5-2-3.4 1.1-1.9a8 8 0 0 1 0-2.1l-1.1-1.9 2-3.4 2.2.5a8 8 0 0 1 2-.9L10.2 5h3.6l.6 2.2a8 8 0 0 1 2 .9l2.2-.5 2 3.4-1.1 1.9a8 8 0 0 1-.1 2.1Z" transform="translate(0 -2) scale(1 .95)" /></>,
+    menu: <path d="M4 6h16M4 12h16M4 18h16" />,
+    close: <path d="m6 6 12 12M18 6 6 18" />,
     search: <><circle cx="10.5" cy="10.5" r="6.5" /><path d="m16 16 5 5" /></>,
     bell: <><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" /></>,
     plus: <><path d="M12 5v14M5 12h14" /></>,
@@ -169,6 +171,15 @@ function isOperationsPage(page: string): page is OperationsPageName {
   ].includes(page);
 }
 
+type AuditNotification = {
+  id: string;
+  actor: string;
+  action: string;
+  target: string;
+  outcome: string;
+  created_at: string;
+};
+
 function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus>("loading");
   const [authNotice, setAuthNotice] = useState("");
@@ -184,6 +195,20 @@ function App() {
   const [loginBusy, setLoginBusy] = useState(false);
 
   const [activePage, setActivePage] = useState("Overview");
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+
+  const [notificationOpen, setNotificationOpen] = useState(false);
+  const [notificationLoading, setNotificationLoading] = useState(false);
+  const [notificationError, setNotificationError] = useState("");
+  const [notifications, setNotifications] = useState<AuditNotification[]>([]);
+  const [notificationScopeKey, setNotificationScopeKey] = useState("");
+  const [notificationRefresh, setNotificationRefresh] = useState(0);
+  const notificationWrapRef = useRef<HTMLDivElement | null>(null);
+
+  // Do not show audit records fetched for another account or workspace.
+  const notificationContextKey = `${session?.email ?? ""}:${selectedTenantId}`;
+  const visibleNotifications =
+    notificationScopeKey === notificationContextKey ? notifications : [];
   const [search, setSearch] = useState("");
   const [environment, setEnvironment] = useState("All environments");
   const [projectFormOpen, setProjectFormOpen] = useState(false);
@@ -197,6 +222,106 @@ function App() {
   const [dataLoading, setDataLoading] = useState(false);
   const [dataError, setDataError] = useState("");
   const [workspaceDataTenantId, setWorkspaceDataTenantId] = useState("");
+
+  useEffect(() => {
+    if (!mobileNavOpen) return;
+
+    const previousOverflow = document.body.style.overflow;
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") setMobileNavOpen(false);
+    }
+
+    function handleResize() {
+      if (window.innerWidth > 900) setMobileNavOpen(false);
+    }
+
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("resize", handleResize);
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("resize", handleResize);
+    };
+  }, [mobileNavOpen]);
+
+  useEffect(() => {
+    if (!notificationOpen) return;
+
+    if (!selectedTenantId) return;
+
+    let cancelled = false;
+
+    async function loadNotifications() {
+      setNotificationLoading(true);
+      setNotificationError("");
+
+      try {
+        const response = await fetch("/api/audit-events?limit=8&offset=0", {
+          credentials: "include",
+          headers: { "X-Tenant-Id": selectedTenantId },
+        });
+
+        if (!response.ok) {
+          throw new Error(await readApiError(response));
+        }
+
+        const body = await response.json() as { data?: unknown };
+
+        if (!Array.isArray(body.data)) {
+          throw new Error("The audit-events response was not in the expected format.");
+        }
+
+        if (!cancelled) {
+          setNotifications(body.data as AuditNotification[]);
+          setNotificationScopeKey(notificationContextKey);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setNotificationError(
+            error instanceof Error
+              ? error.message
+              : "Unable to load recent activity.",
+          );
+        }
+      } finally {
+        if (!cancelled) setNotificationLoading(false);
+      }
+    }
+
+    void loadNotifications();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [notificationOpen, selectedTenantId, notificationRefresh, notificationContextKey]);
+
+  useEffect(() => {
+    if (!notificationOpen) return;
+
+    function closeOnOutsidePointer(event: PointerEvent) {
+      if (
+        event.target instanceof Node &&
+        !notificationWrapRef.current?.contains(event.target)
+      ) {
+        setNotificationOpen(false);
+      }
+    }
+
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") setNotificationOpen(false);
+    }
+
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    document.addEventListener("keydown", closeOnEscape);
+
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [notificationOpen]);
 
   // Never expose records loaded for a different tenant.
   const workspaceDataIsCurrent = isWorkspaceDataCurrent(
@@ -661,8 +786,28 @@ function App() {
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
-        <a className="brand" href="#overview" onClick={() => setActivePage("Overview")}>
+      {mobileNavOpen && (
+        <button
+          className="sidebar-backdrop"
+          type="button"
+          aria-label="Close navigation menu"
+          onClick={() => setMobileNavOpen(false)}
+        />
+      )}
+      <aside
+        id="ppm-sidebar"
+        className={`sidebar ${mobileNavOpen ? "sidebar-open" : ""}`}
+        aria-label="Workspace sidebar"
+      >
+        <a
+          className="brand"
+          href="#overview"
+          onClick={(event) => {
+            event.preventDefault();
+            setActivePage("Overview");
+            setMobileNavOpen(false);
+          }}
+        >
           <span className="brand-mark"><Icon name="database" size={23} /></span>
           <span className="brand-copy"><strong>pg<span>control</span></strong><small>DATABASE PLATFORM</small></span>
         </a>
@@ -707,7 +852,11 @@ function App() {
                 <button
                   key={item.label}
                   className={`nav-link ${activePage === item.label ? "active" : ""}`}
-                  onClick={() => setActivePage(item.label)}
+                  aria-current={activePage === item.label ? "page" : undefined}
+                  onClick={() => {
+                    setActivePage(item.label);
+                    setMobileNavOpen(false);
+                  }}
                 >
                   <Icon name={item.icon} />
                   <span>{item.label}</span>
@@ -722,7 +871,7 @@ function App() {
             <span className="support-icon"><Icon name="shield" size={17} /></span>
             <strong>Security overview</strong>
             <p>Keep your databases protected with least-privilege access.</p>
-            <button onClick={() => setActivePage("Users & access")}>Review access <Icon name="arrow" size={14} /></button>
+            <button onClick={() => { setActivePage("Users & access"); setMobileNavOpen(false); }}>Review access <Icon name="arrow" size={14} /></button>
           </div>
           <div className="sidebar-user">
             <div className="user-avatar">{session.email.slice(0, 1).toUpperCase()}</div>
@@ -744,6 +893,16 @@ function App() {
 
       <main className="main-area">
         <header className="topbar">
+          <button
+            type="button"
+            className="icon-button mobile-menu-toggle"
+            aria-label={mobileNavOpen ? "Close navigation menu" : "Open navigation menu"}
+            aria-expanded={mobileNavOpen}
+            aria-controls="ppm-sidebar"
+            onClick={() => setMobileNavOpen((open) => !open)}
+          >
+            <Icon name={mobileNavOpen ? "close" : "menu"} size={20} />
+          </button>
           <div className="breadcrumbs"><span>Workspace</span><Icon name="chevron" size={14} /><strong>{activePage}</strong></div>
           <div className="topbar-actions">
             <label className="search-box">
@@ -751,7 +910,143 @@ function App() {
               <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search projects..." aria-label="Search projects" />
               <kbd>⌘ K</kbd>
             </label>
-            <button className="icon-button notification-button" aria-label="Notifications"><Icon name="bell" /></button>
+            <div className="notification-wrap" ref={notificationWrapRef}>
+              <button
+                type="button"
+                className="icon-button notification-button"
+                aria-label="Recent activity notifications"
+                aria-expanded={notificationOpen}
+                aria-controls="ppm-notification-panel"
+                onClick={() => {
+                  setMobileNavOpen(false);
+                  setNotificationOpen((open) => !open);
+                }}
+              >
+                <Icon name="bell" />
+              </button>
+
+              {notificationOpen && (
+                <section
+                  id="ppm-notification-panel"
+                  className="notification-panel"
+                  aria-label="Recent workspace activity"
+                  aria-live="polite"
+                >
+                  <header className="notification-panel-header">
+                    <div>
+                      <strong>Recent activity</strong>
+                      <p>Latest events visible to this workspace</p>
+                    </div>
+                    <div className="notification-panel-actions">
+                      <button
+                        type="button"
+                        className="notification-refresh"
+                        onClick={() => setNotificationRefresh((value) => value + 1)}
+                        disabled={notificationLoading}
+                      >
+                        {notificationLoading ? "Loading…" : "Refresh"}
+                      </button>
+                      <button
+                        type="button"
+                        className="notification-close"
+                        aria-label="Close notifications"
+                        onClick={() => setNotificationOpen(false)}
+                      >
+                        <Icon name="close" size={17} />
+                      </button>
+                    </div>
+                  </header>
+
+                  {!selectedTenantId ? (
+                    <p className="notification-message">
+                      Select a workspace to see its recent activity.
+                    </p>
+                  ) : notificationError ? (
+                    <div className="notification-message" role="alert">
+                      <strong>Activity unavailable</strong>
+                      <p>{notificationError}</p>
+                      <button
+                        type="button"
+                        className="notification-refresh"
+                        onClick={() => setNotificationRefresh((value) => value + 1)}
+                      >
+                        Try again
+                      </button>
+                    </div>
+                  ) : notificationLoading && visibleNotifications.length === 0 ? (
+                    <p className="notification-message">Loading recent activity…</p>
+                  ) : visibleNotifications.length === 0 ? (
+                    <p className="notification-message">
+                      No audit events are available for this workspace yet.
+                    </p>
+                  ) : (
+                    <ul className="notification-list">
+                      {visibleNotifications.map((event) => {
+                        const parsedDate = new Date(event.created_at);
+                        const timestamp = Number.isNaN(parsedDate.getTime())
+                          ? event.created_at
+                          : parsedDate.toLocaleString();
+
+                        const targetLabel = event.target.startsWith("database_instance:")
+                          ? `Database · ${event.target.slice("database_instance:".length)}`
+                          : event.target.startsWith("project:")
+                            ? `Project · ${event.target.slice("project:".length)}`
+                            : event.target;
+
+                        return (
+                          <li key={event.id}>
+                            <button
+                              type="button"
+                              className="notification-item"
+                              onClick={() => {
+                                setActivePage("Audit log");
+                                setNotificationOpen(false);
+                                setMobileNavOpen(false);
+                              }}
+                              aria-label={`Open audit log for ${event.action}`}
+                            >
+                              <span className="notification-item-top">
+                                <span className="notification-action">
+                                  {event.action.replace(/[._]/g, " ")}
+                                </span>
+                                <span
+                                  className={`notification-outcome ${
+                                    event.outcome === "failed" ? "failed" : "succeeded"
+                                  }`}
+                                >
+                                  {event.outcome}
+                                </span>
+                              </span>
+                              <span className="notification-target">{targetLabel}</span>
+                              <time
+                                className="notification-time"
+                                dateTime={event.created_at}
+                              >
+                                {timestamp}
+                              </time>
+                            </button>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+
+                  <footer className="notification-panel-footer">
+                    Recent audited activity only. Read/unread status is not tracked yet.
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setActivePage("Audit log");
+                        setNotificationOpen(false);
+                        setMobileNavOpen(false);
+                      }}
+                    >
+                      View audit log
+                    </button>
+                  </footer>
+                </section>
+              )}
+            </div>
             <div className="topbar-divider" />
             <button className="topbar-profile" onClick={() => void handleLogout()} title="Sign out">
               <span className="user-avatar small">{session.email.slice(0, 1).toUpperCase()}</span>
