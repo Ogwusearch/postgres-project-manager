@@ -375,7 +375,7 @@ test(
       // 4. A version gap must be rejected.
       await client.query(`
         UPDATE public.control_schema_migrations
-        SET version = '003', filename = '003_missing_migration.sql'
+        SET version = '004', filename = '004_missing_migration.sql'
         WHERE version = '001'
       `);
 
