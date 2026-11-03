@@ -1,10 +1,14 @@
 packages:
   - "apps/*"
   - "packages/*"
+
 allowBuilds:
   argon2: false
   esbuild: true
 
 overrides:
+  '@eslint/config-array>minimatch': '11.0.3'
+  'eslint>minimatch': '11.0.3'
+  '@typescript-eslint/typescript-estree>minimatch': '11.0.3'
   'fast-uri@>=3.0.0 <3.1.9': '3.1.9'
   'fast-uri@>=4.0.0 <4.2.3': '4.2.3'
